@@ -8,8 +8,7 @@ OpenVDB sequences that Blender loads as Volume objects.
 
 **Status: v0.5.2 Early Access, smoke, fire, noise/upres and liquid (FLIP/APIC) with spray, foam and bubbles.**
 The solver matches Mantaflow's reference scenes to within a few percent, and the Blender add-on
-(panels, bake, resume, cancel, presets, support, updates) works. Progress and design
-decisions are in [PLAN.md](PLAN.md); changes are in [CHANGELOG.md](CHANGELOG.md).
+(panels, bake, resume, cancel, presets, support, updates) works. Changes are in [CHANGELOG.md](CHANGELOG.md).
 
 
 ## Install (Blender extension)
