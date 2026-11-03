@@ -9,7 +9,7 @@ extension, in the site-packages folder the add-on passes in OPENBILLOW_DEPS
 import os
 import sys
 
-__version__ = "0.5.2-early-access"
+__version__ = "0.5.3-early-access"
 
 _DEPS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deps")
 for _d in (_DEPS, os.environ.get("OPENBILLOW_DEPS", "")):

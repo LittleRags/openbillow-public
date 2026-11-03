@@ -101,6 +101,20 @@ class OpenBillowDomain(PropertyGroup):
     sndparticle_boundary: EnumProperty(name="Boundary", default="DELETE",
                                        items=[("DELETE", "Delete", "Remove them."),
                                               ("PUSHOUT", "Push Out", "Push them back out of the obstacle.")], description="What happens to spray, foam and bubbles that touch an obstacle.")
+    sndparticle_antitunneling: EnumProperty(
+        name="Thin Walls", default="AUTO",
+        items=[("OFF", "Off", "Fast particles can jump through thin obstacles, as in Blender."),
+               ("AUTO", "Auto", "Check the path of each particle in steps of half a cell, so none passes through a thin obstacle. Only fast particles cost extra time."),
+               ("FIXED", "Fixed Steps", "Check a fixed number of points along each particle's path, as Mantaflow does.")],
+        description="Stop spray, foam and bubbles passing through thin obstacles. Only used in High Quality; Classic always behaves like Blender.")
+    sndparticle_antitunnel_steps: IntProperty(
+        name="Steps", default=4, min=2, max=16,
+        description="How many points along each particle's path are checked for an obstacle when Thin Walls is Fixed Steps.")
+    sndparticle_sampling: EnumProperty(
+        name="Sampling", default="MULTIPLE",
+        items=[("SINGLE", "Single", "One spot per cell, as in Blender. Fewer particles, in blocks the size of a cell."),
+               ("MULTIPLE", "Multiple", "Eight spots per cell, so particles follow the splash more smoothly. The sampling rates are scaled down automatically, so you get about the same number of particles as Single, but smoother.")],
+        description="How many places in each cell can throw off particles. Only used in High Quality; Classic always behaves like Blender.")
     sndparticle_potential_radius: IntProperty(name="Potential Radius", default=2, min=1, max=4,
                                               description="How far around each spot, in cells, the liquid is checked when deciding whether to make particles.")
     sndparticle_potential_min_wavecrest: FloatProperty(name="Wave Crest Min", default=2.0, min=0.0, max=1000.0,
@@ -336,8 +350,8 @@ class OpenBillowPreferences(AddonPreferences):
 
     cache_root: StringProperty(name="Cache Root", subtype="DIR_PATH", default="", options={"PATH_SUPPORTS_BLEND_RELATIVE"},
                                description="Folder where baked frames are saved, one subfolder per domain. Empty puts them next to the .blend file.")
-    device_mode: EnumProperty(name="Device", default="AUTO", items=[
-        ("AUTO", "Auto", "Bake on the graphics card; use the CPU when the bake does not fit in free graphics memory"),
+    device_mode: EnumProperty(name="Device", default="AUTO", description="Where bakes run. Auto picks the fastest option that fits in memory.", items=[
+        ("AUTO", "Auto", "Bake on the graphics card; when it does not fit, page through system RAM (about 2x slower), else use the CPU"),
         ("GPU", "GPU", "Always bake on the graphics card; refuse bakes that do not fit"),
         ("CPU", "CPU", "Always bake on the CPU. Much slower, but uses system RAM, so larger bakes fit")])
     device: StringProperty(name="GPU", default="",

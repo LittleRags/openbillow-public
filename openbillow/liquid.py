@@ -164,6 +164,9 @@ class LiquidSettings(GuideSettings):
     sndparticle_update_radius: int = 2  # only used by Mantaflow's 'cubic' update, which Blender skips
     sndparticle_width: float = 0.01       # point width written to the USD (m), constant
     sndparticle_boundary: str = "DELETE"  # or "PUSHOUT"
+    sndparticle_antitunneling: str = "OFF"  # OFF (Blender) | AUTO | FIXED (Mantaflow, steps below)
+    sndparticle_antitunnel_steps: int = 4
+    sndparticle_sampling: str = "SINGLE"  # SINGLE (Blender) | MULTIPLE (8 points per cell)
     # Guiding (Blender "Guides", as DomainSettings).
     flows: list[LiquidFlow] = field(default_factory=list)
     obstacles: list[MeshObstacle] = field(default_factory=list)
@@ -281,6 +284,10 @@ class LiquidSolver:
         b, s, sh = self.b, self.s, self.shape
         if s.sndparticle_boundary not in ("DELETE", "PUSHOUT"):
             raise ValueError(f"liquid: unknown sndparticle_boundary {s.sndparticle_boundary!r}")
+        if s.sndparticle_antitunneling not in ("OFF", "AUTO", "FIXED"):
+            raise ValueError(f"liquid: unknown sndparticle_antitunneling {s.sndparticle_antitunneling!r}")
+        if s.sndparticle_sampling not in ("SINGLE", "MULTIPLE"):
+            raise ValueError(f"liquid: unknown sndparticle_sampling {s.sndparticle_sampling!r}")
         self.snd_scale = sc = max(1, int(s.particle_scale))
         self.phi_tmp, self.vel_tmp = b.scalar_grid(sh), b.mac_grid(sh)
         hi = tuple(n * sc for n in sh)
@@ -315,9 +322,10 @@ class LiquidSolver:
                                (s.sndparticle_tau_min_k, s.sndparticle_tau_max_k), self.dx)
         b.sample_secondary_particles(self.snd, flags, vel, self.pot_ta, self.pot_wc, self.pot_ke, nr,
                                      s.sndparticle_k_ta, s.sndparticle_k_wc, s.sndparticle_l_min,
-                                     s.sndparticle_l_max, dt)
+                                     s.sndparticle_l_max, dt, sampling=s.sndparticle_sampling)
         b.update_secondary_particles(self.snd, flags, vel, nr, self.gravity, s.sndparticle_k_b,
-                                     s.sndparticle_k_d, dt)
+                                     s.sndparticle_k_d, dt, antitunneling=s.sndparticle_antitunneling,
+                                     antitunnel_steps=s.sndparticle_antitunnel_steps)
         if s.sndparticle_boundary == "PUSHOUT":
             b.push_out_of_obstacles(self.snd, self.phi_obs_sp, shift=1.0)
         b.delete_particles_in_obstacle(self.snd, flags)

@@ -23,6 +23,7 @@ from .warp_pressure import MGPressureSolver, _curvature_kernel
 from .warp_diffusion import DiffusionSolver
 from .warp_viscosity import ViscositySolver
 from .warp_forcefields import compute_forces_kernel, noise_hash, pack_fields
+from ..estimate import RAM_RESERVE, managed_budget, system_memory  # noqa: F401 - system_memory re-exported
 from ..noise import _A_COEFFS as WAVELET_A_COEFFS, uv_weight
 
 vec6i = wp.types.vector(length=6, dtype=wp.int32)
@@ -1143,45 +1144,18 @@ def _outflow_vel_kernel(flags: wp.array3d(dtype=wp.int32), new_vel: wp.array3d(d
     vel[i, j, k] = r
 
 
-def system_memory() -> tuple[int, int]:
-    """(total, available) system RAM in bytes; (0, 0) if unknown."""
-    import sys
-    if sys.platform == "win32":
-        import ctypes
-
-        class _MemStatus(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        st = _MemStatus()
-        st.dwLength = ctypes.sizeof(st)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-            return st.ullTotalPhys, st.ullAvailPhys
-        return 0, 0
-    try:
-        info = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                k, v = line.split(":", 1)
-                info[k] = int(v.split()[0]) * 1024
-        return info["MemTotal"], info.get("MemAvailable", info["MemFree"])
-    except (OSError, KeyError, ValueError):
-        import os
-        try:  # macOS and other POSIX
-            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            return total, total // 2
-        except (ValueError, OSError, AttributeError):
-            return 0, 0
-
-
 class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Backend):
     name = "warp"
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, managed: bool = False):
         wp.init()
         self.device = wp.get_device(device) if device else wp.get_preferred_device()
+        # CUDA managed memory: grids may exceed VRAM and page through system RAM (about 2x slower).
+        # Set before the first array; it applies to every later allocation on this device.
+        # The allocator is per device and global, so a plain backend restores the built-in one.
+        self.managed = bool(managed) and self.device.is_cuda
+        if self.device.is_cuda:
+            wp.set_device_allocator(self.device, wp.CudaManagedAllocator() if self.managed else None)
         self._allocated = 0  # bytes requested through this backend (no frees)
         self._reduce = wp.zeros(1, dtype=wp.float32, device=self.device)
         self._tmp = {}  # advection work grids, see _scratch
@@ -1206,13 +1180,17 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
 
     def memory(self) -> BackendMemory:
         d = self.device
-        if d.is_cuda and wp.is_mempool_enabled(d):
+        if d.is_cuda and wp.is_mempool_enabled(d) and not self.managed:
             allocated = wp.get_mempool_used_mem_current(d)
         else:
             allocated = self._allocated
         if not d.is_cuda:  # Warp reports 0 for the CPU; use system RAM
             total, free = system_memory()
             return BackendMemory(total=total, free=free, allocated=allocated)
+        if self.managed:  # VRAM plus the RAM budget (see estimate.managed_budget)
+            ram_total, ram_free = system_memory()
+            return BackendMemory(total=d.total_memory + max(0, ram_total - RAM_RESERVE),
+                                 free=managed_budget(d.free_memory, ram_free), allocated=allocated)
         return BackendMemory(total=d.total_memory, free=d.free_memory, allocated=allocated)
 
     def synchronize(self) -> None:

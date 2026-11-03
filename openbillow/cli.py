@@ -247,16 +247,18 @@ class Bake:
         from . import estimate
         obs = settings.estimate_kwargs()
         need = estimate.estimate_bytes(settings.size, settings.resolution_max, **obs)
-        b = _pick_backend(args.device, need, log)
+        b = _pick_backend(args.device, need, log, managed=getattr(args, "managed", False))
         m0 = b.memory()
         base_used = m0.total - m0.free  # other processes (Blender, desktop) + our CUDA context
-        log(f"OpenBillow {__version__}, device {b.device_name}, frames {f0}-{f1}, "
+        mode = "cpu" if b.on_cpu else ("managed" if getattr(b, "managed", False) else "gpu")
+        self.set_status(device=b.device_name, device_mode=mode)
+        log(f"OpenBillow {__version__}, device {b.device_name} ({mode}), frames {f0}-{f1}, "
             f"resolution_max {settings.resolution_max}")
         mem = b.memory()
         if mem.total and need > mem.free:  # the context already exists here, so only grids are missing
             res = estimate.max_resolution_for(
                 mem.free / 2**20 + estimate.FIXED_MB, settings.size, **obs)
-            what = "RAM" if b.on_cpu else "VRAM"
+            what = "RAM" if b.on_cpu else ("VRAM + RAM" if mode == "managed" else "VRAM")
             raise BakeError(
                 f"needs about {need / 2**20:.0f} MB of {what} but only {mem.free / 2**20:.0f} MB "
                 f"are free on {b.device_name}; try resolution_max {res} or free memory",
@@ -362,25 +364,46 @@ class Bake:
         return EXIT_CANCELLED
 
 
-def _pick_backend(device, need, log):
-    """`auto` (or empty) = the GPU if one exists and the bake fits in its free memory, else
-    the CPU (slower, uses system RAM). `auto:cuda:1` picks the GPU to try. Any other value
-    is passed to the backend as is."""
+def _pick_backend(device, need, log, managed=False):
+    """`auto` (or empty) follows estimate.device_plan: the GPU if the bake fits in free VRAM,
+    else the GPU with managed memory paging through system RAM, else the CPU (slower, uses
+    system RAM). When nothing fits it returns the option with the most room, so the caller's
+    over-limit check names the largest resolution. `auto:cuda:1` picks the GPU to try. Any
+    other value is passed to the backend as is. `managed` forces managed memory (tests)."""
+    from . import estimate
     from .backend import get_backend
     device = device or "auto"
     if not device.startswith("auto"):
-        return get_backend("warp", device)
+        return get_backend("warp", device, managed=managed)
+    gpu = device[5:] or "cuda"
+    if managed:
+        return get_backend("warp", gpu, managed=True)
     try:
-        b = get_backend("warp", device[5:] or "cuda")
+        b = get_backend("warp", gpu)
     except Exception as e:  # noqa: BLE001 - no CUDA device or driver
         log(f"no usable GPU ({type(e).__name__}: {str(e)[:120]}); running on the CPU")
         return get_backend("warp", "cpu")
-    free = b.memory().free
-    if need <= free:
+    vram_free = b.memory().free
+    ram_free = estimate.system_memory()[1]
+    ok = estimate.managed_ok()
+    plan = estimate.device_plan(need, vram_free, ram_free, ok)
+    if plan == "none":  # does not fit anywhere: take the most room for the error message
+        if ok:
+            plan = "managed"
+        elif ram_free > vram_free:
+            plan = "cpu"
+        else:
+            plan = "gpu"
+    if plan == "gpu":
         return b
-    log(f"needs about {need / 2**20:.0f} MB but only {free / 2**20:.0f} MB of VRAM are free on "
-        f"{b.device_name}; running on the CPU (slower)")
-    del b
+    name = b.device_name
+    del b  # drop the probe; a managed backend sets the allocator before its first array
+    if plan == "managed":
+        log(f"needs about {need / 2**20:.0f} MB, {vram_free / 2**20:.0f} MB of VRAM free on {name}: "
+            f"paging through system RAM (about 2x slower)")
+        return get_backend("warp", gpu, managed=True)
+    log(f"needs about {need / 2**20:.0f} MB but only {vram_free / 2**20:.0f} MB of VRAM are free on "
+        f"{name}; running on the CPU (slower)")
     return get_backend("warp", "cpu")
 
 
@@ -513,6 +536,7 @@ def main(argv=None):
     b.add_argument("--resume", action="store_true", help="continue from the newest checkpoint")
     b.add_argument("--frame-end", type=int, help="override frame_end from bake.json")
     b.add_argument("--device", help="auto (default: GPU, or the CPU when the bake does not fit), auto:cuda:1, cpu, or cuda:0")
+    b.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)  # force managed memory (tests)
     b.add_argument("--checkpoint-every", type=int, default=10, metavar="N")
     b.add_argument("--keep-checkpoints", type=int, default=1, metavar="N")
     e = sub.add_parser("estimate", help="print the VRAM estimate for a bake folder (JSON)")

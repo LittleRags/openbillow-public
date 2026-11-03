@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "openbillow"
-version = "0.5.2-early-access"
+version = "0.5.3-early-access"
 name = "OpenBillow"
 tagline = "GPU smoke solver that bakes OpenVDB sequences"
 maintainer = "LittleRags"

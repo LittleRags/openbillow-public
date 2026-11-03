@@ -843,8 +843,11 @@ class Backend(ABC):
                                    pot_ta: ScalarGrid, pot_wc: ScalarGrid, pot_ke: ScalarGrid,
                                    neighbor_ratio: ScalarGrid, k_ta: float, k_wc: float,
                                    life_min: float, life_max: float, dt: float,
-                                   c_s: float = 0.4, c_b: float = 0.77) -> None:
-        """Append int(KE * (k_ta*TA + k_wc*WC) * dt) particles per FLUID cell
+                                   c_s: float = 0.4, c_b: float = 0.77,
+                                   sampling: str = "SINGLE") -> None:
+        """`sampling` MULTIPLE (Mantaflow's 'multiple' sampler): 8 fixed points per cell at
+        +-0.25, potentials interpolated at each, the same count formula per point, cylinder
+        radius 0.25 (SINGLE: one random point, radius 0.5). Append int(KE * (k_ta*TA + k_wc*WC) * dt) particles per FLUID cell
         in a cylinder along the local flow, typed by the cell's neighbour ratio
         (< c_s spray, > c_b bubble, else foam), in Mantaflow's serial order and
         random stream. Mantaflow `flipSampleSecondaryParticles(mode='single')`."""
@@ -853,13 +856,17 @@ class Backend(ABC):
     def update_secondary_particles(self, parts: Particles, flags: FlagGrid, vel: MACGrid,
                                    neighbor_ratio: ScalarGrid, gravity: Vec3, k_b: float,
                                    k_d: float, dt: float, c_s: float = 0.4,
-                                   c_b: float = 0.77) -> None:
+                                   c_b: float = 0.77, antitunneling: str = "OFF",
+                                   antitunnel_steps: int = 4) -> None:
         """Retype each particle by the neighbour ratio of its cell, then move it:
         spray ballistic (gravity), bubbles buoyant with drag towards the grid
         velocity, foam with the grid velocity. Life -= dt; particles outside
         the grid or with life <= 0 are deleted, then compacted (order kept).
         `gravity` in cell units. Mantaflow `flipUpdateSecondaryParticles(mode=
-        'linear', scale=False, antitunneling=0)`; the force pdata is always 0."""
+        'linear', scale=False, antitunneling=0)`; the force pdata is always 0.
+        `antitunneling`: OFF (Blender), FIXED (Mantaflow's N = `antitunnel_steps`) or AUTO (per
+        particle N = ceil(|step| / 0.5 cell) + 1, at most 16). The points ct/N of the step, ct =
+        1..N-1, are tested; a particle out of bounds or in an obstacle there is deleted."""
 
     @abstractmethod
     def delete_particles_in_obstacle(self, parts: Particles, flags: FlagGrid) -> None:

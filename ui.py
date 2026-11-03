@@ -7,6 +7,22 @@ from . import export, ops, presets
 from .props import prefs
 
 
+
+_PLAN_TEXT = {"gpu": ("Fits in VRAM", "CHECKMARK"),
+              "managed": ("Will page through system RAM (about 2x slower)", "INFO"),
+              "cpu": ("Will bake on the CPU (much slower)", "INFO"),
+              "none": ("Does not fit in VRAM or RAM; lower the resolution", "ERROR")}
+_ram = [0.0, 0]  # (time read, free bytes): the panel redraws often, /proc/meminfo is read at most every 2 s
+
+
+def _ram_free():
+    import time
+    from .openbillow import estimate
+    now = time.monotonic()
+    if now - _ram[0] > 2.0:
+        _ram[:] = [now, estimate.system_memory()[1]]
+    return _ram[1]
+
 class _Panel(Panel):
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -78,13 +94,20 @@ class OPENBILLOW_PT_domain(_Panel):
         limit = prefs().limit_mb()
         mode = prefs().device_mode
         over = mode != "CPU" and limit is not None and mb > limit
+        plan = None
+        if mode == "AUTO" and limit is not None:  # the limit stands in for free VRAM (no Warp here)
+            plan = estimate.device_plan(mb * estimate.MB, limit * estimate.MB, _ram_free(),
+                                        estimate.managed_ok())
         row = col.row()
-        row.alert = over and mode == "GPU"
+        row.alert = (over and mode == "GPU") or plan == "none"
         mem = "RAM" if mode == "CPU" else "VRAM"
         row.label(text=f"{shape[0]}×{shape[1]}×{shape[2]}  ≈ {mb:.0f} MB {mem}"
                        + (f" (limit {limit:.0f})" if limit is not None and mode != "CPU" else ""))
-        if over and mode == "AUTO":
-            col.label(text="Too big for the GPU: will bake on the CPU (slower)", icon="INFO")
+        if plan is not None:
+            text, icon = _PLAN_TEXT[plan]
+            r = col.row()
+            r.alert = plan == "none"
+            r.label(text=text, icon=icon)
         col.prop(d, "use_scene_range")
         if not d.use_scene_range:
             col.prop(d, "frame_start")
@@ -248,11 +271,14 @@ class OPENBILLOW_PT_domain_secondary(_Panel):
         if not (d.use_spray_particles or d.use_foam_particles or d.use_bubble_particles):
             return
         col = lay.column()
-        for p in ("particle_scale", "sndparticle_boundary", "sndparticle_potential_radius",
+        for p in ("particle_scale", "sndparticle_boundary", "sndparticle_antitunneling",
+                  "sndparticle_sampling", "sndparticle_potential_radius",
                   "sndparticle_sampling_wavecrest", "sndparticle_sampling_trappedair",
                   "sndparticle_life_min", "sndparticle_life_max", "sndparticle_bubble_buoyancy",
                   "sndparticle_bubble_drag", "sndparticle_width"):
             col.prop(d, p)
+            if p == "sndparticle_antitunneling" and d.sndparticle_antitunneling == "FIXED":
+                col.prop(d, "sndparticle_antitunnel_steps")
         sub = col.column(align=True)
         for p in ("sndparticle_potential_min_wavecrest", "sndparticle_potential_max_wavecrest",
                   "sndparticle_potential_min_trappedair", "sndparticle_potential_max_trappedair",

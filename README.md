@@ -6,7 +6,7 @@ A GPU smoke solver for Blender. It follows Blender's Mantaflow gas algorithm,
 runs on NVIDIA GPUs through [Warp](https://github.com/NVIDIA/warp), and writes
 OpenVDB sequences that Blender loads as Volume objects.
 
-**Status: v0.5.2 Early Access, smoke, fire, noise/upres and liquid (FLIP/APIC) with spray, foam and bubbles.**
+**Status: v0.5.3 Early Access, smoke, fire, noise/upres and liquid (FLIP/APIC) with spray, foam and bubbles.**
 The solver matches Mantaflow's reference scenes to within a few percent, and the Blender add-on
 (panels, bake, resume, cancel, presets, support, updates) works. Changes are in [CHANGELOG.md](CHANGELOG.md).
 
@@ -59,6 +59,10 @@ install path has not been run on Windows yet.
      liquids, a cleaner splash surface. Liquids also get *Surface Tension* (High Quality
      only; slower bakes) and a *High Quality* Mesh Generator (flatter surfaces, thin
      splash sheets, fewer blobby drops) next to Blender's *Final* and *Fast*.
+   - Liquid volume grows when a body of water thins into sheets (a dam break can end
+     up well above its starting volume). This is FLIP behaviour that Blender's
+     Mantaflow shows too, and more strongly; it is not a bug. *Volume Correction*
+     (on by default) limits it.
 
 5. **Bake.** Press **Bake**. Progress, ETA, peak VRAM and seconds per frame show
    in the panel. When it finishes, a Volume object `<Domain>_OpenBillow` is added,
@@ -71,8 +75,10 @@ install path has not been run on Windows yet.
 
 
 6. **Preferences** (Edit > Preferences > Add-ons > OpenBillow): *Cache Root*,
-   *Device* (*Auto*: the graphics card, or the CPU when the bake doesn't fit in free
-   graphics memory; *GPU*: always the card, bakes that don't fit are refused; *CPU*:
+   *Device* (*Auto*: the graphics card; when the bake doesn't fit in free graphics
+   memory, the card pages through system RAM (about 2x slower, Linux only for now), and
+   without a usable card the CPU; the domain panel says which one it will be; *GPU*:
+   always the card, bakes that don't fit are refused; *CPU*:
    always the CPU, much slower but uses system RAM), *GPU* (a Warp device such as
    `cuda:0`; empty is the default card), and *VRAM Limit (MB)* (in *GPU* mode, bakes
    estimated above it are refused; 0 means detected total minus 1 GB).

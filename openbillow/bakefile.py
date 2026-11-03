@@ -23,14 +23,15 @@ from .forcefields import EffectorWeights, ForceField
 from .liquid import LiquidFlow, LiquidSettings
 from .solver import DomainSettings, MeshFlow, MeshGuide, MeshObstacle
 
-SCHEMA = 14  # 2: fire settings (domain fire fields, flow_type, fuel_amount); 3: flow emit_start/emit_end;
+SCHEMA = 16  # 2: fire settings (domain fire fields, flow_type, fuel_amount); 3: flow emit_start/emit_end;
 # 4: noise settings (use_noise, noise_upres, noise_strength, noise_pos_scale, noise_time_anim);
 # 5: domain_type and liquid domains (LiquidSettings, LiquidFlow fields);
 # 6: force_fields, effector_weights, render_fps; 7: domain_mat3; 8: Turbulence fields (use_global_coords);
 # 9: gas domain dimensions (2D); 10: liquid use_fractions, fractions_threshold, fractions_distance;
 # 11: guiding (use_guide, guide_alpha, guide_beta, guide_vel_factor, guide_source, guide_parent, write_guide, guides);
 # 12: COMBUSTION fire model (fire_model, heat_release, cooling, cooling_radiative, expansion, flame_kelvin,
-# ambient_kelvin, disturbance, disturbance_size, disturbance_rate, shredding); 13: LiquidFlow emit_start/emit_end; 14: quality, surface_tension, mesh_generator ANISOTROPIC
+# ambient_kelvin, disturbance, disturbance_size, disturbance_rate, shredding); 13: LiquidFlow emit_start/emit_end; 14: quality, surface_tension, mesh_generator ANISOTROPIC;
+# 15: sndparticle_antitunneling, sndparticle_antitunnel_steps; 16: sndparticle_sampling
 _OBS_FIELDS = ("surface_thickness", "plane_init")
 _GUIDE_FIELDS = _OBS_FIELDS + ("guide_mode", "vel_multi")
 _SKIP = ("flows", "obstacles", "guides", "force_fields", "effector_weights")

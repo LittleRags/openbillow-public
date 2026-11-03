@@ -175,19 +175,85 @@ def _potentials_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype=
     pot_ke[i, j, k] = _clamp_potential(ek, ke_lo, ke_hi)
 
 
+@wp.func
+def _interp_scalar(g: wp.array3d(dtype=wp.float32), p: wp.vec3):
+    # Grid::getInterpolated: trilinear, the value of cell i sits at coordinate i, clamped inside.
+    nx = g.shape[0]
+    ny = g.shape[1]
+    nz = g.shape[2]
+    x = wp.clamp(p[0], 0.0, float(nx - 1) - 1e-4)
+    y = wp.clamp(p[1], 0.0, float(ny - 1) - 1e-4)
+    z = wp.clamp(p[2], 0.0, float(nz - 1) - 1e-4)
+    i = int(x)
+    j = int(y)
+    k = int(z)
+    fx = x - float(i)
+    fy = y - float(j)
+    fz = z - float(k)
+    return ((1.0 - fz) * ((1.0 - fy) * ((1.0 - fx) * g[i, j, k] + fx * g[i + 1, j, k])
+                          + fy * ((1.0 - fx) * g[i, j + 1, k] + fx * g[i + 1, j + 1, k]))
+            + fz * ((1.0 - fy) * ((1.0 - fx) * g[i, j, k + 1] + fx * g[i + 1, j, k + 1])
+                    + fy * ((1.0 - fx) * g[i, j + 1, k + 1] + fx * g[i + 1, j + 1, k + 1])))
+
+
+@wp.func
+def _sub_point(i: int, j: int, k: int, q: int):
+    # the 8 fixed sample points of a cell (multiple mode): cell centre +-0.25
+    return wp.vec3(float(i) + wp.where((q & 1) != 0, 0.75, 0.25),
+                   float(j) + wp.where((q & 2) != 0, 0.75, 0.25),
+                   float(k) + wp.where((q & 4) != 0, 0.75, 0.25))
+
+
 @wp.kernel
 def _sample_count_kernel(flags: wp.array3d(dtype=wp.int32), pot_ta: wp.array3d(dtype=wp.float32),
                          pot_wc: wp.array3d(dtype=wp.float32), pot_ke: wp.array3d(dtype=wp.float32),
-                         k_ta: float, k_wc: float, dt: float,
+                         k_ta: float, k_wc: float, dt: float, mode: int,
                          count: wp.array3d(dtype=wp.int32), draws: wp.array3d(dtype=wp.int32)):
-    # Particles per cell and random numbers it takes (3 for the cell offset, 4 per particle),
-    # stored [k, j, i] so the flat scan runs in Mantaflow's loop order.
+    # Particles per cell and random numbers it takes (single: 3 for the cell offset, 4 per
+    # particle; multiple: 4 per particle), stored [k, j, i] so the flat scan runs in
+    # Mantaflow's loop order.
     i, j, k = wp.tid()
     n = int(0)
     if (flags[i, j, k] & FLUID) != 0:
-        n = int(pot_ke[i, j, k] * (k_ta * pot_ta[i, j, k] + k_wc * pot_wc[i, j, k]) * dt)
+        if mode == 0:
+            n = int(pot_ke[i, j, k] * (k_ta * pot_ta[i, j, k] + k_wc * pot_wc[i, j, k]) * dt)
+        else:
+            for q in range(8):
+                xp = _sub_point(i, j, k, q)
+                n += int(_interp_scalar(pot_ke, xp) * (k_ta * _interp_scalar(pot_ta, xp)
+                                                       + k_wc * _interp_scalar(pot_wc, xp)) * dt)
     count[k, j, i] = n
-    draws[k, j, i] = wp.where(n != 0, 3 + 4 * n, 0)
+    draws[k, j, i] = wp.where(n != 0, wp.where(mode == 0, 3, 0) + 4 * n, 0)
+
+
+@wp.func
+def _emit_cylinder(vel: wp.array4d(dtype=wp.float32), xi: wp.vec3, n: int, radius: float, dt: float,
+                   l_min: float, l_max: float, temp: float, typ: int, rnd: wp.array(dtype=wp.float32),
+                   r0: int, s0: int, pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
+                   life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32)):
+    # n particles in a cylinder of the given radius along the local flow; returns the next slot
+    vi = _mac_interp(vel, xi)
+    d = dt * vi
+    e1 = _normalized(wp.vec3(d[2], 0.0, -d[0]))
+    e2 = _normalized(_cross(e1, d))
+    vn = _normalized(vi)
+    dlen = _norm(d)
+    r = r0
+    s = s0
+    for q in range(n):
+        rad = radius * wp.sqrt(rnd[r])
+        theta = wp.float32(wp.float64(rnd[r + 1] * 2.0) * M_PI)
+        hgt = rnd[r + 2] * dlen
+        rc = rad * wp.cos(theta)
+        rs = rad * wp.sin(theta)
+        pos[s] = xi + rc * e1 + rs * e2 + hgt * vn
+        pvel[s] = rc * e1 + rs * e2 + vi
+        life[s] = wp.float32(wp.float64((l_max - l_min) * temp + l_min)
+                             + wp.float64(rnd[r + 3]) * wp.float64(0.1))
+        flag[s] = typ
+        r += 4
+        s += 1
+    return s
 
 
 @wp.kernel
@@ -197,6 +263,7 @@ def _sample_emit_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype
                         count: wp.array3d(dtype=wp.int32), slot: wp.array3d(dtype=wp.int32),
                         rstart: wp.array3d(dtype=wp.int32), rnd: wp.array(dtype=wp.float32),
                         base: int, dt: float, l_min: float, l_max: float, c_s: float, c_b: float,
+                        k_ta: float, k_wc: float, mode: int,
                         pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
                         life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32)):
     # knFlipSampleSecondaryParticles (3D)
@@ -209,33 +276,28 @@ def _sample_emit_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype
     ke = pot_ke[i, j, k]
     ta = pot_ta[i, j, k]
     wc = pot_wc[i, j, k]
-    xi = wp.vec3(float(i), float(j), float(k)) + wp.vec3(rnd[r], rnd[r + 1], rnd[r + 2])
-    r += 3
-    vi = _mac_interp(vel, xi)
-    d = dt * vi
-    e1 = _normalized(wp.vec3(d[2], 0.0, -d[0]))
-    e2 = _normalized(_cross(e1, d))
-    vn = _normalized(vi)
-    dlen = _norm(d)
-    temp = (ke + ta + wc) / 3.0
     nr = ratio[i, j, k]
     typ = PFOAM
     if nr < c_s:
         typ = PSPRAY
     elif nr > c_b:
         typ = PBUBBLE
-    for q in range(n):
-        rad = 0.5 * wp.sqrt(rnd[r])
-        theta = wp.float32(wp.float64(rnd[r + 1] * 2.0) * M_PI)
-        hgt = rnd[r + 2] * dlen
-        rc = rad * wp.cos(theta)
-        rs = rad * wp.sin(theta)
-        pos[s + q] = xi + rc * e1 + rs * e2 + hgt * vn
-        pvel[s + q] = rc * e1 + rs * e2 + vi
-        life[s + q] = wp.float32(wp.float64((l_max - l_min) * temp + l_min)
-                                 + wp.float64(rnd[r + 3]) * wp.float64(0.1))
-        flag[s + q] = typ
-        r += 4
+    if mode == 0:
+        xi = wp.vec3(float(i), float(j), float(k)) + wp.vec3(rnd[r], rnd[r + 1], rnd[r + 2])
+        r += 3
+        s = _emit_cylinder(vel, xi, n, 0.5, dt, l_min, l_max,
+                           (ke + ta + wc) / 3.0, typ, rnd, r, s, pos, pvel, life, flag)
+        return
+    for sq in range(8):
+        xp = _sub_point(i, j, k, sq)
+        ke_p = _interp_scalar(pot_ke, xp)
+        ta_p = _interp_scalar(pot_ta, xp)
+        wc_p = _interp_scalar(pot_wc, xp)
+        np_ = int(ke_p * (k_ta * ta_p + k_wc * wc_p) * dt)
+        if np_ > 0:
+            s = _emit_cylinder(vel, xp, np_, 0.25, dt, l_min, l_max,
+                               (ke_p + ta_p + wc_p) / 3.0, typ, rnd, r, s, pos, pvel, life, flag)
+            r += 4 * np_
 
 
 @wp.func
@@ -250,8 +312,12 @@ def _in_bounds(p: wp.vec3, shape: wp.vec3i):
 def _update_kernel(pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
                    life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32),
                    vel: wp.array4d(dtype=wp.float32), ratio: wp.array3d(dtype=wp.float32),
-                   g: wp.vec3, k_b: float, k_d: float, c_s: float, c_b: float, dt: float):
-    # knFlipUpdateSecondaryParticlesLinear (antitunneling 0, f_sec = 0)
+                   flags: wp.array3d(dtype=wp.int32), g: wp.vec3, k_b: float, k_d: float,
+                   c_s: float, c_b: float, dt: float, at_mode: int, at_steps: int):
+    # knFlipUpdateSecondaryParticlesLinear (f_sec = 0). at_mode 0 = off (Blender), 2 = Mantaflow
+    # antitunneling with at_steps sub-steps, 1 = per particle steps of at most half a cell.
+    # The sub-step points ct/N * dt*v, ct = 1..N-1, are tested like Mantaflow does; the particle
+    # is killed when one is out of bounds or in an obstacle.
     t = wp.tid()
     f = flag[t]
     if (f & (PDELETE | PTRACER)) != 0:
@@ -262,19 +328,32 @@ def _update_kernel(pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
         return
     nr = ratio[int(p[0]), int(p[1]), int(p[2])]
     v = pvel[t]
+    dv = wp.vec3(0.0, 0.0, 0.0)  # displacement per dt, for the antitunneling test
     if nr < c_s:
         f = (f | PSPRAY) & ~(PBUBBLE | PFOAM)
         v = v + dt * g
-        p = p + dt * v
+        dv = dt * v
     elif nr > c_b:
         f = (f | PBUBBLE) & ~(PSPRAY | PFOAM)
         vg = _mac_interp(vel, p) - v
         vj = wp.vec3(vg[0] / dt, vg[1] / dt, vg[2] / dt)
         v = v + dt * (k_b * -g + k_d * vj)
-        p = p + dt * v
+        dv = dt * v
     else:
         f = (f | PFOAM) & ~(PBUBBLE | PSPRAY)
-        p = p + dt * _mac_interp(vel, p)
+        dv = dt * _mac_interp(vel, p)
+    if at_mode != 0:
+        n = at_steps
+        if at_mode == 1:
+            n = wp.min(int(wp.ceil(wp.length(dv) / 0.5)) + 1, 16)
+        sh = wp.vec3i(flags.shape[0], flags.shape[1], flags.shape[2])
+        for ct in range(1, n):
+            q = p + (float(ct) / float(n)) * dv
+            if not _in_bounds(q, sh):
+                f = f | PDELETE
+            elif (flags[int(wp.floor(q[0])), int(wp.floor(q[1])), int(wp.floor(q[2]))] & SKIP_CELL) != 0:
+                f = f | PDELETE
+    p = p + dv
     l = life[t] - dt
     if l <= 0.0:
         f = f | PDELETE
@@ -319,16 +398,18 @@ class SecondaryMixin:
                           neighbor_ratio], device=dev)
 
     def sample_secondary_particles(self, parts, flags, vel, pot_ta, pot_wc, pot_ke, neighbor_ratio,
-                                   k_ta, k_wc, life_min, life_max, dt, c_s=0.4, c_b=0.77):
+                                   k_ta, k_wc, life_min, life_max, dt, c_s=0.4, c_b=0.77,
+                                   sampling="SINGLE"):
         dev = self.device
         shape = tuple(flags.shape)
         f32 = lambda x: float(np.float32(x))  # noqa: E731
+        mode = {"SINGLE": 0, "MULTIPLE": 1}[sampling]
         count = self._scratch_int(shape[::-1], "snd_count")
         draws = self._scratch_int(shape[::-1], "snd_draws")
         slot = self._scratch_int(shape[::-1], "snd_slot")
         rstart = self._scratch_int(shape[::-1], "snd_rstart")
         wp.launch(_sample_count_kernel, dim=shape,
-                  inputs=[flags, pot_ta, pot_wc, pot_ke, f32(k_ta), f32(k_wc), f32(dt), count, draws],
+                  inputs=[flags, pot_ta, pot_wc, pot_ke, f32(k_ta), f32(k_wc), f32(dt), mode, count, draws],
                   device=dev)
         wp.utils.array_scan(count.reshape(-1), slot.reshape(-1), inclusive=False)
         wp.utils.array_scan(draws.reshape(-1), rstart.reshape(-1), inclusive=False)
@@ -340,16 +421,19 @@ class SecondaryMixin:
         wp.launch(_sample_emit_kernel, dim=shape,
                   inputs=[flags, _f4(vel), pot_ta, pot_wc, pot_ke, neighbor_ratio, count, slot, rstart,
                           self._random_stream(n_rnd), parts.n, f32(dt), f32(life_min), f32(life_max),
-                          f32(c_s), f32(c_b), parts.pos, parts.vel, parts.life, parts.flag], device=dev)
+                          f32(c_s), f32(c_b), f32(k_ta), f32(k_wc), mode, parts.pos, parts.vel, parts.life,
+                          parts.flag], device=dev)
         parts.n += total
 
     def update_secondary_particles(self, parts, flags, vel, neighbor_ratio, gravity, k_b, k_d, dt,
-                                   c_s=0.4, c_b=0.77):
+                                   c_s=0.4, c_b=0.77, antitunneling="OFF", antitunnel_steps=4):
         if parts.n:
             f32 = lambda x: float(np.float32(x))  # noqa: E731
             wp.launch(_update_kernel, dim=parts.n,
                       inputs=[parts.pos, parts.vel, parts.life, parts.flag, _f4(vel), neighbor_ratio,
-                              wp.vec3(*gravity), f32(k_b), f32(k_d), f32(c_s), f32(c_b), f32(dt)],
+                              flags, wp.vec3(*gravity), f32(k_b), f32(k_d), f32(c_s), f32(c_b), f32(dt),
+                              {"OFF": 0, "AUTO": 1, "FIXED": 2}[antitunneling],
+                              max(2, int(antitunnel_steps))],
                       device=self.device)
         self._compact(parts)
 

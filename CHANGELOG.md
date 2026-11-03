@@ -1,10 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 Early Access (2026-11-03)
 
+- New liquid setting *Sampling* (spray, foam and bubbles; High Quality): *Multiple* tries
+  eight spots per cell, so particles follow the splash smoothly instead of in cell-sized
+  blocks. The sampling rates are scaled down automatically, so the particle count stays about
+  the same as with Single. *Single* matches Blender; Classic always uses it.
+- New liquid setting *Thin Walls* (spray, foam and bubbles; High Quality): checks the path of
+  each particle so fast ones no longer jump through thin obstacles. *Auto* checks in steps of
+  half a cell (only fast particles cost extra), *Fixed Steps* matches Mantaflow, *Off* matches
+  Blender. Classic quality always uses Off.
 - New preference *Device*: *Auto* (default), *GPU* or *CPU*. Auto bakes on the graphics
-  card and falls back to the CPU (slower, system RAM) when the bake doesn't fit in free
-  graphics memory, instead of refusing it. The command line takes `--device auto|cpu|cuda:0`.
+  card; when the bake doesn't fit in free graphics memory it keeps the card and pages the
+  grids through system RAM (about 2x slower, still 30x+ faster than the CPU; Linux for now),
+  and uses the CPU only without a usable card (or on Windows), instead of refusing the bake.
+  The domain panel shows which one Auto will use. The command line takes
+  `--device auto|cpu|cuda:0`; the bake log and status.json record the mode.
 
 ## 0.5.2 Early Access (2026-11-03)
 

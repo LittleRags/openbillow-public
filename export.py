@@ -72,6 +72,18 @@ _SND = {"sndparticle_tau_min_wc": "potential_min_wavecrest", "sndparticle_tau_ma
         "sndparticle_l_min": "life_min", "sndparticle_l_max": "life_max"}
 
 
+# Multiple sampling throws about 3x the particles at equal rates (A/B 2026-11-03: 200/40 -> 65/13
+# gave the same count), so the user's Blender-style rates are divided to keep the amount comparable.
+_MULTIPLE_RATE_SCALE = 0.325
+
+
+def _multiple_rates(ds):
+    if ds.quality == "CLASSIC" or ds.sndparticle_sampling != "MULTIPLE":
+        return {}
+    return {"sndparticle_k_wc": round(ds.sndparticle_sampling_wavecrest * _MULTIPLE_RATE_SCALE),
+            "sndparticle_k_ta": round(ds.sndparticle_sampling_trappedair * _MULTIPLE_RATE_SCALE)}
+
+
 _FIELD_SHAPES = ("POINT", "PLANE", "LINE")
 
 
@@ -143,7 +155,12 @@ def liquid_domain_kw(scene, ds) -> dict:
                                            "use_bubble_particles", "particle_scale",
                                            "sndparticle_boundary", "sndparticle_potential_radius",
                                            "sndparticle_width")},
+            "sndparticle_antitunneling": ("OFF" if ds.quality == "CLASSIC"
+                                          else ds.sndparticle_antitunneling),
+            "sndparticle_antitunnel_steps": ds.sndparticle_antitunnel_steps,
+            "sndparticle_sampling": ("SINGLE" if ds.quality == "CLASSIC" else ds.sndparticle_sampling),
             **{k: getattr(ds, "sndparticle_" + v) for k, v in _SND.items()},
+            **_multiple_rates(ds),
             **{k: getattr(ds, k) for k in ("mesh_generator", "mesh_scale", "mesh_particle_radius",
                                            "mesh_smoothen_pos", "mesh_smoothen_neg",
                                            "mesh_concave_upper", "mesh_concave_lower")}}

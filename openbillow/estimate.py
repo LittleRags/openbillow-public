@@ -8,6 +8,9 @@ exactly linear; with a moving obstacle 160 (moving only) and 168 (moving +
 static), also linear; fire adds 20. Noise was measured the same way (upres 2 and 4,
 64-192/256, smoke and fire; tests/measure_vram.py plume). `FIXED_MB` is the CUDA context + Warp modules (measured
 ~200 MB over a bare process; rounded up). Mesh BVHs are KBs and ignored."""
+import os
+import sys
+
 MB = 2**20
 PER_CELL = 124          # bytes: grids, advection work grids, MGPCG vectors/levels
 PER_CELL_OBSTACLE = 4   # phi_obs
@@ -107,7 +110,7 @@ def estimate_bytes(size, resolution_max, has_obstacles=False, moving_obstacles=F
                    noise_upres=0, liquid=False, apic=False, particles_per_cell=0.0, mesh_scale=1,
                    secondary=False, particle_scale=1, viscosity=False, diffusion=False,
                    force_fields=False, dimensions=3, fractions=False, guiding=False, combustion=False,
-                   high_quality=False):
+                   high_quality=False, snd_multiple=False):
     """Bytes the solver allocates on the device (excluding the context).
     noise_upres 0 = noise off. liquid=True: a liquid domain (fire and noise
     ignored) with `particles_per_cell` from liquid_particles_per_cell and the
@@ -128,7 +131,7 @@ def estimate_bytes(size, resolution_max, has_obstacles=False, moving_obstacles=F
                         + particles_per_cell * (PER_PARTICLE_APIC if apic else PER_PARTICLE)
                         + PER_MESH_CELL * max(1, int(mesh_scale)) ** 3
                         + ((PER_CELL_SND + PER_SND_GRID_CELL * max(1, int(particle_scale)) ** 3
-                            + SND_PARTICLES_PER_CELL * PER_SND_PARTICLE) if secondary else 0)))
+                            + SND_PARTICLES_PER_CELL * (4 if snd_multiple else 1) * PER_SND_PARTICLE) if secondary else 0)))
     per = PER_CELL + (PER_CELL_OBSTACLE if has_obstacles or moving_obstacles else 0)
     total = n * (per + (PER_CELL_MOVING if moving_obstacles else 0)
                  + (PER_CELL_FIRE if fire else 0) + (PER_CELL_COMBUSTION if fire and combustion else 0) + (PER_CELL_FORCES if force_fields else 0)
@@ -146,6 +149,66 @@ def estimate_total_mb(size, resolution_max, *args, **kw):
 
 def default_limit_mb(total_bytes):
     return max(0, total_bytes // MB - HEADROOM_MB)
+
+
+def system_memory() -> tuple[int, int]:
+    """(total, available) system RAM in bytes; (0, 0) if unknown."""
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(st)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return st.ullTotalPhys, st.ullAvailPhys
+        return 0, 0
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024
+        return info["MemTotal"], info.get("MemAvailable", info["MemFree"])
+    except (OSError, KeyError, ValueError):
+        try:  # macOS and other POSIX
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            return total, total // 2
+        except (ValueError, OSError, AttributeError):
+            return 0, 0
+
+
+def managed_ok():
+    """CUDA managed memory beyond VRAM works on Linux; Windows (WDDM) may refuse it, so it stays
+    off there until tested (Auto then falls back to the CPU)."""
+    return sys.platform != "win32"
+
+
+RAM_RESERVE = 4 * 2**30  # system RAM kept free for Blender and the OS when paging the GPU grid
+
+
+def managed_budget(vram_free, ram_free):
+    """Bytes a managed-memory bake may use: free VRAM plus free RAM minus RAM_RESERVE."""
+    return vram_free + max(0, ram_free - RAM_RESERVE)
+
+
+def device_plan(need, vram_free, ram_free, managed_ok):
+    """Where Device Auto bakes `need` bytes: "gpu" (fits in free VRAM), "managed" (GPU with CUDA
+    managed memory paging through system RAM, about 2x slower), "cpu" (no GPU, or managed
+    unavailable, and it fits in free RAM) or "none". vram_free is None without a CUDA GPU.
+    One source of truth for the CLI and the panel."""
+    if vram_free is not None:
+        if need <= vram_free:
+            return "gpu"
+        if managed_ok and need <= managed_budget(vram_free, ram_free):
+            return "managed"
+    if need <= ram_free:
+        return "cpu"
+    return "none"
 
 
 def max_resolution_for(limit_mb, size, *args, **kw):
