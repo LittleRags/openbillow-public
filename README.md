@@ -11,7 +11,6 @@ The solver matches Mantaflow's reference scenes to within a few percent, and the
 (panels, bake, resume, cancel, presets, support, updates) works. Progress and design
 decisions are in [PLAN.md](PLAN.md); changes are in [CHANGELOG.md](CHANGELOG.md).
 
-<img src="docs/img/06-result-upres.png" width="400" alt="Smoke baked with OpenBillow, rendered in Blender">
 
 ## Install (Blender extension)
 
@@ -27,7 +26,6 @@ Build it with `tools/build_extension.py`.
    `<blender python> -m pip install --target <extension folder>/deps --no-deps warp-lang==1.18.0`
    elsewhere and copy the folder over.
 
-   ![The OpenBillow add-on in Preferences](docs/img/AddOnScreen.png)
 
 An NVIDIA GPU with a recent driver is required (v1 is CUDA only). The Windows
 install path has not been run on Windows yet.
@@ -40,7 +38,6 @@ install path has not been run on Windows yet.
    *Density*, *Temperature*, *Surface Emission* (how far from the surface smoke
    is added), *Volume Emission*, and *Is Planar* for flat meshes.
 
-   ![Domain and Flow in the Physics tab](docs/img/02-domain-flow.png)
 3. **Obstacle** (optional). Select a mesh and click **Obstacle**. Smoke flows
    around it and is pushed by it when it moves. *Thickness* and *Is Planar*
    work as for Flow. Obstacles can be animated (keyframes, parenting,
@@ -64,9 +61,6 @@ install path has not been run on Windows yet.
      only; slower bakes) and a *High Quality* Mesh Generator (flatter surfaces, thin
      splash sheets, fewer blobby drops) next to Blender's *Final* and *Fast*.
 
-   ![Domain settings](docs/img/03-domain-settings.png)
-   ![Physics sub-panel](docs/img/03b-physics.png)
-   ![Border collisions](docs/img/03c-border.png)
 5. **Bake.** Press **Bake**. Progress, ETA, peak VRAM and seconds per frame show
    in the panel. When it finishes, a Volume object `<Domain>_OpenBillow` is added,
    showing the VDB sequence.
@@ -76,9 +70,7 @@ install path has not been run on Windows yet.
    - **Refresh VDB on Bake** (under Cache, on by default) makes Blender reload the
      baked files when a bake ends, so baking again over old frames shows the new result.
 
-   ![Baking progress](docs/img/04-baking.png)
 
-   ![Baked result in the viewport](docs/img/05-result.png)
 6. **Preferences** (Edit > Preferences > Add-ons > OpenBillow): *Cache Root*,
    *Device* (*Auto*: the graphics card, or the CPU when the bake doesn't fit in free
    graphics memory; *GPU*: always the card, bakes that don't fit are refused; *CPU*:
