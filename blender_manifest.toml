@@ -1,0 +1,22 @@
+schema_version = "1.0.0"
+
+id = "openbillow"
+version = "0.5.2-early-access"
+name = "OpenBillow"
+tagline = "GPU smoke solver that bakes OpenVDB sequences"
+maintainer = "LittleRags"
+type = "add-on"
+
+website = "https://github.com/LittleRags/openbillow"
+
+tags = ["Physics"]
+
+blender_version_min = "4.5.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 OpenBillow contributors"]
+
+# NVIDIA GPU only in v1 (Warp/CUDA). Warp is downloaded on first use, so one zip fits all.
+
+[permissions]
+files = "Read and write the bake cache folder"
+network = "Warp download, support requests, preset downloads (on click)"
