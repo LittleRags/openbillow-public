@@ -4,9 +4,6 @@ the support API. The add-on enforces nothing; the server decides who is entitled
 probe runs in the CLI subprocess (this module never imports Warp)."""
 import json
 import os
-import platform
-import re
-import subprocess
 import textwrap
 import threading
 import urllib.error
@@ -16,93 +13,17 @@ import bpy
 from bpy.props import StringProperty
 from bpy.types import Operator
 
-from . import activation, errlog, ops
+from . import activation, ops
+from .diagnostics import MAX_DIAG, MAX_LOG, collect, scrub  # noqa: F401  (re-exported for tests)
 from .openbillow import __version__
 from .props import prefs
 
 API = "https://support.pipelineflow.co.uk/tickets"
 SITE = "https://pipelineflow.co.uk"
 EMAIL = "support@pipelineflow.co.uk"
-MAX_DIAG = 32 * 1024
-MAX_LOG = 64 * 1024
 TEXT_NAME = "OpenBillow support request"
 _result = {"state": "idle", "msg": ""}  # idle | sending | ok | error
 _pending = {}  # what the preview showed, which is exactly what Send posts
-
-
-# ---- collection ------------------------------------------------------------
-def scrub(text):
-    """Home folders and user names out of paths."""
-    text = re.sub(r"(?i)[a-z]:[\\/]+users[\\/]+[^\\/\s\"']+", "~", text)
-    text = re.sub(r"/(?:home|Users)/[^/\s\"']+", "~", text)
-    home = os.path.expanduser("~")
-    return text.replace(home, "~") if len(home) > 3 else text
-
-
-def _tail(path, n):
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            fh.seek(max(0, fh.tell() - n))
-            return fh.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
-def _jit_error(folder):
-    """Last error block from the bake stdout/log, trimmed."""
-    for name in ("bake.stdout", "bake.log"):
-        lines = _tail(os.path.join(folder, name), 16384).splitlines()
-        hits = [i for i, l in enumerate(lines) if re.search(r"error|nvrtc|failed|traceback", l, re.I)]
-        if hits:
-            return scrub("\n".join(lines[hits[-1]:hits[-1] + 12]))[:2000]
-    return None
-
-
-def _domain_settings(ob):
-    """Numbers, booleans and enums of the domain. No strings, so no names or paths."""
-    ds = ob.openbillow.domain
-    out = {}
-    for p in ds.bl_rna.properties:
-        if p.identifier == "rna_type" or p.type not in {"INT", "FLOAT", "BOOLEAN", "ENUM"}:
-            continue
-        v = getattr(ds, p.identifier)
-        if p.type == "ENUM" and p.is_enum_flag:
-            v = sorted(v)
-        elif p.type != "ENUM" and p.array_length:
-            v = [round(x, 6) if isinstance(x, float) else x for x in v]
-        elif isinstance(v, float):
-            v = round(v, 6)
-        out[p.identifier] = v
-    return out
-
-
-def collect(context, want_log, want_errors=False):
-    """-> (diagnostics dict, log string or None). Blocks for the Warp probe (a few seconds)."""
-    d = {"os": platform.platform(), "blender_version": bpy.app.version_string,
-         "python_version": platform.python_version(), "openbillow_version": __version__}
-    try:
-        args = ["diagnostics"] + (["--device", prefs().device] if prefs().device else [])
-        d.update(ops.run_cli(*args))
-    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-        d["device_init_error"] = scrub(f"diagnostics probe failed: {e}")[:500]
-    d["last_jit_error"] = None
-    d["recent_errors"] = [scrub(l) for l in errlog.recent()] if want_errors else None
-    log = None
-    ob = ops.domain_of(context)
-    if ob:
-        d["domain"] = _domain_settings(ob)
-        try:
-            folder = ops.bake_folder(ob)
-        except Exception:  # unsaved .blend with a relative cache folder
-            folder = None
-        if folder:
-            d["last_jit_error"] = _jit_error(folder)
-            if want_log:
-                log = scrub(_tail(os.path.join(folder, "bake.log"), MAX_LOG)) or None
-    while len(json.dumps(d)) > MAX_DIAG and d.get("domain"):
-        d["domain"].popitem()
-    return d, log
 
 
 def build_payload(context):

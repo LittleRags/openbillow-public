@@ -1,0 +1,50 @@
+name: Bug report
+description: Something crashed, looks wrong, or the bake gives the wrong result.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. In Blender: **Preferences > Add-ons > OpenBillow > Bug reports > Copy Diagnostics**, then paste it below. It holds versions, GPU, your domain settings, the last bake error and, if ticked, recent OpenBillow warnings. Folder names are removed from paths. Read it before you post.
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste the output of Copy Diagnostics.
+      render: json
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Where did you get OpenBillow?
+      options: ["extensions.blender.org", "pipelineflow.co.uk (site build)", "GitHub", "Other"]
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What were you simulating?
+      multiple: true
+      options: ["Smoke", "Fire", "Liquid", "Secondary particles (foam, spray, bubbles)", "Noise / upres", "Obstacles", "Command line / farm"]
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Fewest steps from a new scene. A small .blend (zipped, drag it into this box) helps a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Bake log (optional)
+      description: The last lines of bake.log in your cache folder, if the bake failed.
+      render: text

@@ -1,8 +1,8 @@
 # OpenBillow
 
-Website, buying and support: https://pipelineflow.co.uk/openbillow/
+Website, buying and support: https://openbillow.com/
 
-A GPU smoke solver for Blender. It follows Blender's Mantaflow gas algorithm,
+GPU smoke, fire and liquid simulation for Blender. It follows Blender's Mantaflow gas algorithm,
 runs on NVIDIA GPUs through [Warp](https://github.com/NVIDIA/warp), and writes
 OpenVDB sequences that Blender loads as Volume objects.
 
@@ -11,23 +11,52 @@ The solver matches Mantaflow's reference scenes to within a few percent, and the
 (panels, bake, resume, cancel, presets, support, updates) works. Changes are in [CHANGELOG.md](CHANGELOG.md).
 
 
-## Install (Blender extension)
+## Add to Blender
 
-One small zip (about 70 KB) works on Windows and Linux. macOS is out: Warp needs CUDA.
-Build it with `tools/build_extension.py`.
+**From the OpenBillow repository** (Blender 4.5 or newer; Blender then offers updates itself):
+1. Edit > Preferences > Get Extensions > the **Repositories** drop-down (top right) > **+** > **Add Remote Repository**.
+2. Paste `https://openbillow.com/extensions/index.json`, tick *Check for Updates on Startup* if you want, and click Create.
+3. Search **OpenBillow** under Get Extensions and click Install.
 
-1. In Blender: Edit > Preferences > Get Extensions > the arrow menu (top right)
-   > **Install from Disk…**, then choose `openbillow-<version>.zip`.
-2. Enable the add-on and open the Physics tab of a mesh object.
-3. First use only: click **Install GPU Engine** in the OpenBillow panel. It downloads
-   NVIDIA Warp (about 105 MB) from PyPI into the add-on's folder. Needs internet.
-   On a machine without internet, run
+You can also drag the zip onto the Blender window.
+
+**From a zip** (offline): download `openbillow-<version>.zip` from the
+[GitHub releases](https://github.com/LittleRags/openbillow-public/releases/latest), then Edit > Preferences
+> Get Extensions > the arrow menu (top right) > **Install from Disk…**. Or build it yourself
+with `blender --command extension build` from this repository. Zip installs use the add-on's own update button.
+
+One small zip (about 300 KB) works on Windows and Linux. macOS is out: Warp needs CUDA.
+
+Then:
+1. Enable the add-on and open the Physics tab of a mesh object.
+2. First use only: click **Install GPU Engine** in the OpenBillow panel. It downloads
+   NVIDIA Warp (about 105 MB) from PyPI into the add-on's folder, and only when you click.
+   Needs internet. On a machine without internet, run
    `<blender python> -m pip install --target <extension folder>/deps --no-deps warp-lang==1.18.0`
    elsewhere and copy the folder over.
 
 
 An NVIDIA GPU with a recent driver is required (v1 is CUDA only). The Windows
-install path has not been run on Windows yet.
+install path has been tested on one machine (Blender 5.2, RTX 3090).
+
+## What is free, what is paid
+
+The add-on and the solver are free and open source (GPL-3.0-or-later): smoke, fire, liquid,
+noise/upres, obstacles, quality modes, and a **base pack of ready-made presets** built into
+the add-on. No key, no sign-up, no download.
+
+Optional, paid ($10 in early access) at https://openbillow.com/:
+- the **premium preset pack** (hero looks such as Campfire, Explosion, Fuel Fire, Honey, with
+  their materials), downloaded with a licence key;
+- **support** from inside Blender (*Send support request*).
+
+Nothing in the add-on is locked: the key only unlocks the premium download and support.
+
+**Two builds of the same code.** This repository is the full build, the one served from the
+website: it can install NVIDIA Warp on first use and has the update check, licence activation,
+support box and premium-preset download. The version on extensions.blender.org (when
+available) is a trimmed build of the same source: Warp is bundled, and it has none of the
+network features and only the base preset pack.
 
 ## Using the add-on
 
@@ -82,17 +111,21 @@ install path has not been run on Windows yet.
    always the CPU, much slower but uses system RAM), *GPU* (a Warp device such as
    `cuda:0`; empty is the default card), and *VRAM Limit (MB)* (in *GPU* mode, bakes
    estimated above it are refused; 0 means detected total minus 1 GB).
-7. **Presets** (licensed; Preferences > *Presets and materials*). Enter your licence
-   key and email, press *Download*, then pick a look (campfire, explosion, honey ...) from
-   the *Presets* menu in the domain panel. Resolution stays as you set it.
+7. **Presets** (the *Presets* menu in the domain panel). The **base pack** is built in and
+   free; its entries are marked "(base)": Heavy Smoke, Splash, Foam, Oil Fire. Picking one sets
+   the domain, flow and material for that look. Your resolution stays as you set it; a preset
+   that was tuned at a particular resolution tells you which. The **premium pack** is separate:
+   in Preferences > *Presets and materials* accept the licence, enter your key and email, press
+   *Download*, and the extra looks join the same menu.
 8. **Support** (Preferences > *Send support request*). Describe the problem and press
    *Send*. You see exactly what will be sent first (GPU, versions, the end of the bake log,
    recent Blender errors; home folders are replaced by `~`). Nothing is sent unless
    Blender's online access is on and you press Send. *Save diagnostics to file* is the
    offline option.
-9. **Updates** (Preferences > *Updates*). *Check for Updates* looks for a newer version
-   (once per session automatically when online access is on), then *Download* and *Install*;
-   restart Blender afterwards. Only your version and system type are sent.
+9. **Updates.** Installed from the OpenBillow repository, Blender updates the add-on. Installed from
+   a zip, use Preferences > *Updates* > *Check for Updates* (once per session automatically
+   when online access is on), then *Download* and *Install*; restart Blender afterwards. Only
+   your version and system type are sent.
 
 Every setting has a plain-language tooltip: hover over it.
 
@@ -149,28 +182,6 @@ Each frame's `.vdb` holds these grids (half float, world-space transform):
   *Flame Temperature*) where there is heat, and 0 elsewhere; feed it straight to a Blackbody shader.
 - `flame` (fire only).
 
-## Setup (development)
-
-Requires Blender 4.5 or later (tested on 4.5, 5.1, 5.2, 5.3) and an NVIDIA GPU.
-Earlier builds (2.93–4.2) lack Blender's `openvdb` Python module, which the VDB
-writer needs. Install Warp into `deps/` using
-Blender's bundled Python:
-
-```sh
-<blender>/5.2/python/bin/python3.13 -m pip install --target deps --no-deps -r requirements.txt
-```
-
-## Running
-
-From the project root:
-
-```sh
-<blender>/5.2/python/bin/python3.13 -I tests/test_pressure.py
-<blender>/5.2/python/bin/python3.13 -I tests/run_plume.py 64 60 out/plume
-```
-
-The second command writes `out/plume/fluid_data_NNNN.vdb` per frame.
-
 ## Speed
 
 ```mermaid
@@ -222,7 +233,7 @@ Blender 5.1's bundled Python works (it includes `openvdb`); Warp is picked up
 from `deps/` in the project root.
 
 ```sh
-/home/andre/Blender-5.1/5.1/python/bin/python3.13 -I openbillow_bake.py bake <bake_folder> [--resume] [--frame-end N]
+<blender>/5.2/python/bin/python3.13 -I openbillow_bake.py bake <bake_folder> [--resume] [--frame-end N]
 ```
 
 Use a command job (not `simple-blender-render`) with one task per bake. A bake
@@ -232,16 +243,10 @@ from the latest checkpoint. Only one bake may use a folder at a time. Check
 `status.json` and `bake.log` in the folder. Each worker compiles Warp's kernels
 on its first bake (see above), so expect frame 1 to take about 25 s there.
 
-## Layout
-
-- `openbillow/` – the solver (no `bpy`), with GPU code behind `openbillow/backend/`.
-- `tests/` – tests and comparison scripts.
-- `reference/` – Blender and Mantaflow source files used as the reference, plus
-  bake and comparison scripts. See `reference/SOURCE.txt`.
-
 ## Licence
 
-GPL-3.0-or-later (see [LICENSE](LICENSE)). Files copied from Blender and
+GPL-3.0-or-later (see [LICENSE](https://github.com/LittleRags/openbillow-public/blob/main/LICENSE)). Files copied from Blender and
 Mantaflow keep their original licence headers (GPL-2.0-or-later and
-Apache-2.0). The add-on is free. The preset pack and the in-add-on support are a
-paid option (see Presets and Support above); the pack has its own licence.
+Apache-2.0). The add-on, including its base presets, is free under the GPL. The premium
+preset pack and in-add-on support are a paid option (see *What is free, what is paid*); the
+premium pack has its own licence.

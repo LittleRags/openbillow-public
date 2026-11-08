@@ -4,6 +4,7 @@ import bpy
 from bpy.types import Panel
 
 from . import export, ops, presets
+from .flavor import STORE
 from .props import prefs
 
 
@@ -50,12 +51,16 @@ class OPENBILLOW_PT_main(Panel):
         ob, lay = context.object, self.layout
         if not ops.warp_available():
             box = lay.box()
-            st = ops._install
+            st = {"state": "idle", "msg": ""}
+            if not STORE:
+                from . import warp_install
+                st = warp_install._install
             if st["state"] == "running":
                 box.label(text="Downloading GPU engine (about 105 MB)...", icon="TIME")
             else:
                 box.label(text="The GPU engine (Warp) is not installed.", icon="ERROR")
-                box.operator("openbillow.install_warp", icon="IMPORT")
+                if not STORE:
+                    box.operator("openbillow.install_warp", icon="IMPORT")
                 if st["state"] == "error":
                     box.label(text=st["msg"])
             box.label(text="The first bake compiles GPU kernels and takes longer.")
@@ -67,6 +72,7 @@ class OPENBILLOW_PT_main(Panel):
             row = lay.row()
             row.prop(ob.openbillow, "role", text="Type")
             row.operator("openbillow.set_role", text="", icon="X").role = "NONE"
+        lay.operator("openbillow.report_bug", icon="URL")
 
 
 class OPENBILLOW_PT_domain(_Panel):
@@ -206,7 +212,8 @@ class OPENBILLOW_PT_domain_liquid(_Panel):
         return super().poll(context) and context.object.openbillow.domain.domain_type == "LIQUID"
 
     def draw(self, context):
-        d = context.object.openbillow.domain
+        ob = context.object
+        d = ob.openbillow.domain
         lay = self.layout
         lay.use_property_split = True
         col = lay.column()

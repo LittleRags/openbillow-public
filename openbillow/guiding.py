@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Fluid guiding (Blender "Guides", PLAN.md step 40), for the gas and liquid
+"""Fluid guiding (Blender "Guides"), for the gas and liquid
 solvers: the guide velocity built once per frame from guide effectors
 (Blender's "Bake Guides" pass: `manta_guiding` + `bake_guiding_process`), the
 per-substep target velocity (`fluid_pre_step`) and `PD_fluid_guiding` in place
@@ -31,7 +31,7 @@ class Guiding:
         self.vel_factor = float(vel_factor)
         self.two_d = two_d
         # weight = alpha everywhere. Blender's alpha is 1..100; below ~0.5 the
-        # PD loop diverges (PLAN.md 40a), so clamp for CLI users.
+        # PD loop diverges, so clamp for CLI users.
         self.weight = b.scalar_grid(shape, max(1.0, float(alpha)))
         self.vel_target = b.mac_grid(shape)
         self.guidevel = b.mac_grid(shape)

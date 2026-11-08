@@ -19,29 +19,31 @@ if __name__ + ".openbillow" not in sys.modules:
     sys.modules[_spec.name] = _core
     _spec.loader.exec_module(_core)
 
-if "props" in locals():  # F8 reload
+from .flavor import STORE  # noqa: E402
+
+# Network modules exist only in the site build (see flavor.py).
+_NET = ("activation", "support", "presets_online", "updates", "warp_install")
+_ORDER = ("errlog", "props", "export", "ops", "diagnostics", "activation", "support", "presets", "presets_online",
+          "warp_install", "updates", "ui")
+_MODS = [m for m in _ORDER if not (STORE and m in _NET)]
+if "_loaded" in locals():  # F8 reload
     import importlib
-    for _m in (errlog, props, export, ops, activation, support, presets, updates, ui):
+    for _m in _loaded:
         importlib.reload(_m)
 else:
-    from . import errlog, props, export, ops, activation, support, presets, updates, ui  # noqa: F401
+    import importlib
+    _loaded = [importlib.import_module("." + m, __name__) for m in _MODS]
+_by = {m.__name__.rsplit(".", 1)[1]: m for m in _loaded}
+props, ops, ui = _by["props"], _by["ops"], _by["ui"]
 
 
 def register():
-    props.register()
-    ops.register()
-    activation.register()
-    support.register()
-    presets.register()
-    updates.register()
-    ui.register()
+    for m in _loaded:
+        if hasattr(m, "register"):
+            m.register()
 
 
 def unregister():
-    ui.unregister()
-    updates.unregister()
-    presets.unregister()
-    support.unregister()
-    activation.unregister()
-    ops.unregister()
-    props.unregister()
+    for m in reversed(_loaded):
+        if hasattr(m, "unregister"):
+            m.unregister()

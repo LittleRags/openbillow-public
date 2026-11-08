@@ -9,7 +9,7 @@ Flows are meshes with behaviour GEOMETRY (initial liquid, sampled on every
 substep of the first frame), INFLOW (every substep, optionally with an
 initial velocity) or OUTFLOW (deletes liquid). Obstacles are static or move
 by transform, as for smoke. Open domain sides delete liquid that reaches them.
-Guiding: see guiding.py (PLAN.md step 40). Surface tension is not
+Guiding: see guiding.py. Surface tension is not
 ported because Blender's script passes no phi to solvePressure, so it has no
 effect there either.
 """

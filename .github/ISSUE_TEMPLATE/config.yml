@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and how-to
+    url: https://github.com/LittleRags/openbillow-public/discussions
+    about: Ask how to get a look, share setups, or discuss ideas.
+  - name: Premium presets and paid support
+    url: https://openbillow.com/
+    about: Licence keys, the premium preset pack and priority support.

@@ -377,7 +377,7 @@ class OpenBillowPreferences(AddonPreferences):
                                         description="Include the last 20 warnings and errors OpenBillow saw. Your home folder name is hidden.")
 
     def draw(self, context):
-        from . import presets, support, updates
+        from .flavor import STORE
         col = self.layout.column()
         col.prop(self, "cache_root")
         col.prop(self, "device_mode")
@@ -392,11 +392,19 @@ class OpenBillowPreferences(AddonPreferences):
             row.label(text=f"{self.device_name} ({self.device_total_mb} MB)" if self.device_total_mb
                       else "GPU not detected yet")
         else:
-            row.operator("openbillow.install_warp", icon="IMPORT")
+            if not STORE:
+                row.operator("openbillow.install_warp", icon="IMPORT")
             row.label(text="GPU engine (Warp) not installed", icon="ERROR")
-        support.draw_box(self.layout)
-        presets.draw_box(self.layout)
-        updates.draw_box(self.layout)
+        from . import diagnostics
+        box = self.layout.box()
+        box.label(text="Bug reports", icon="ERROR")
+        diagnostics.draw_report(box)
+        box.prop(self, "support_attach_errors", text="Include recent OpenBillow warnings")
+        if not STORE:
+            from . import presets_online, support, updates
+            support.draw_box(self.layout)
+            presets_online.draw_box(self.layout)
+            updates.draw_box(self.layout)
 
     def device_arg(self):
         """--device value for the CLI."""

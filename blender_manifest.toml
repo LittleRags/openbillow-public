@@ -1,19 +1,19 @@
 schema_version = "1.0.0"
 
 id = "openbillow"
-version = "0.5.3-early-access"
+version = "0.5.4-early-access"
 name = "OpenBillow"
-tagline = "GPU smoke solver that bakes OpenVDB sequences"
+tagline = "GPU smoke, fire and liquid simulation for Blender"
 maintainer = "LittleRags"
 type = "add-on"
 
-website = "https://github.com/LittleRags/openbillow"
+website = "https://openbillow.com"
 
 tags = ["Physics"]
 
 blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
-copyright = ["2026 OpenBillow contributors"]
+copyright = ["2026 Pipelineflow Ltd"]
 
 # NVIDIA GPU only in v1 (Warp/CUDA). Warp is downloaded on first use, so one zip fits all.
 

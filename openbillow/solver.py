@@ -81,7 +81,7 @@ class MeshObstacle(_MeshObject):
 @dataclass
 class MeshGuide(MeshObstacle):
     """A guide object (Blender effector, type Guide): not an obstacle; its
-    velocity inside the mesh becomes the guiding target (PLAN.md step 40).
+    velocity inside the mesh becomes the guiding target.
     `surface_thickness` is the effector's Surface Thickness."""
     guide_mode: str = "OVERRIDE"    # OVERRIDE | AVERAGED | MAX | MIN
     vel_multi: float = 1.0
@@ -214,7 +214,7 @@ class DomainSettings(GuideSettings):
     # keeps more swirl and detail for a second pressure solve and one more velocity grid.
     quality: str = "CLASSIC"
     # 3, or 2 = world X-Z plane: a 3-cell slab in Y at the domain's Y centre
-    # (Y size ignored, y sides always walls; PLAN.md step 37).
+    # (Y size ignored, y sides always walls).
     dimensions: int = 3
     # Noise / upres (Blender wavelet turbulence): a high-res density built
     # after each frame from the low-res state, which it does not change.

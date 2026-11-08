@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest something OpenBillow should do.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to make?
+      description: Describe the result you want (a look, a shot, a workflow), not only the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: textarea
+    id: refs
+    attributes:
+      label: References
+      description: Links or images of the look you are after (optional).

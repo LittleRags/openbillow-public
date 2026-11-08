@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4 Early Access (2026-11-05)
+
+- A small set of base presets now ships inside the add-on, so there is something to start from
+  without downloading anything.
+- New *Copy Diagnostics* and *Report a Bug* buttons: copy your version, GPU and settings to the
+  clipboard and open the bug-report form.
+
 ## 0.5.3 Early Access (2026-11-03)
 
 - New liquid setting *Sampling* (spray, foam and bubbles; High Quality): *Multiple* tries

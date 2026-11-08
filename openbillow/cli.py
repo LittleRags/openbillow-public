@@ -2,7 +2,7 @@
 """Command line: `openbillow_bake.py bake <folder> [--resume] [--frame-end N]
 [--device cuda:0] [--checkpoint-every 10] [--keep-checkpoints 1]`.
 
-Bake folder layout (PLAN.md, Phase 4 design): bake.json + objects.npz in,
+Bake folder layout: bake.json + objects.npz in,
 vdb/openbillow_####.vdb, state/state_####.npz, status.json, bake.log (and guide/####.npy
 for guide parents) out;
 bake.lock while running, CANCEL to ask a running bake to stop.

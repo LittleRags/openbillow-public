@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Scene exporter: builds a bake folder (bake.json + objects.npz) from a Blender
-scene. See PLAN.md, Phase 4 design. No UI here; the operators (4.5) collect the
+scene. See the bake-folder layout in openbillow/cli.py. No UI here; the operators (4.5) collect the
 objects and their settings and call `export_bake`.
 
 The `*_kw` helpers read settings with Blender's FluidDomain/Flow/Effector

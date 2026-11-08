@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Bake folder format: `bake.json` (settings) + `objects.npz` (mesh arrays)
-<-> `DomainSettings`. See PLAN.md, Phase 4 design.
+<-> `DomainSettings`.
 
 bake.json: {"schema", "openbillow_version", "domain_type" (GAS | LIQUID),
             "frame_start", "frame_end", "domain": {...}, "flows": [{"name", "key", ...}],

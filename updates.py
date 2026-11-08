@@ -20,6 +20,19 @@ from bpy.types import Operator
 
 from .openbillow import __version__
 
+try:  # written only by `build_extension.py --store`
+    from ._store_build import STORE
+except ImportError:
+    STORE = False
+
+def repo_install(package=__package__ or ""):
+    """True when installed from a remote extension repository (bl_ext.<repo>.openbillow); a zip
+    installed from disk lands in user_default (or the development repo), so keeps the custom updater."""
+    parts = package.split(".")
+    return len(parts) > 2 and parts[0] == "bl_ext" and parts[1] not in ("user_default", "vscode_development")
+
+
+REPO = repo_install()
 API = "https://support.pipelineflow.co.uk/version"
 HOST = "pipelineflow.co.uk"
 MAX_ZIP = 200 * 1024 * 1024
@@ -168,6 +181,13 @@ class OPENBILLOW_OT_update_install(Operator):
 
 
 def draw_box(layout):
+    if STORE:
+        return
+    if REPO:
+        box = layout.box()
+        box.label(text=f"Installed {__version__}", icon="CHECKMARK")
+        box.label(text="Updates come through Blender's Get Extensions.")
+        return
     box = layout.box()
     box.label(text=f"Updates (installed {__version__})", icon="FILE_REFRESH")
     on = bpy.app.online_access
@@ -196,7 +216,8 @@ _classes = (OPENBILLOW_OT_update_check, OPENBILLOW_OT_update_download, OPENBILLO
 def register():
     for c in _classes:
         bpy.utils.register_class(c)
-    bpy.app.timers.register(_auto_check, first_interval=5.0)
+    if not STORE and not REPO:
+        bpy.app.timers.register(_auto_check, first_interval=5.0)
 
 
 def unregister():

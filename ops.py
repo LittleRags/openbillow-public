@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Operators, the bake process and the status poll timer. The add-on never
 imports Warp: it exports a bake folder and runs openbillow_bake.py in a subprocess
-(Blender's own Python). Progress comes from <folder>/status.json (PLAN.md,
-Phase 4 design)."""
+(Blender's own Python). Progress comes from <folder>/status.json.
+"""
 import importlib.util
 import json
 import contextlib
@@ -143,10 +143,6 @@ def read_status(folder):
         return None
 
 
-WARP_PIP = "warp-lang==1.18.0"
-_install = {"state": "idle", "msg": ""}  # idle | running | done | error
-
-
 def deps_dir():
     """Where Warp is installed: the extension's user folder (survives add-on updates),
     or ROOT/deps in a dev checkout."""
@@ -166,24 +162,6 @@ def _use_deps():
 def warp_available():
     _use_deps()
     return importlib.util.find_spec("warp") is not None
-
-
-def _pip(args):
-    r = subprocess.run([sys.executable, "-m", "pip", *args], capture_output=True, text=True)
-    if r.returncode:
-        raise RuntimeError((r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else "pip failed")
-
-
-def _install_worker(target):
-    try:
-        try:
-            _pip(["--version"])
-        except RuntimeError:
-            subprocess.run([sys.executable, "-m", "ensurepip", "--user"], capture_output=True, check=True)
-        _pip(["install", "--target", target, "--no-deps", "--upgrade", WARP_PIP])
-        _install.update(state="done", msg="")
-    except Exception as e:  # shown in the panel
-        _install.update(state="error", msg=str(e)[:200])
 
 
 def _cli(*args):
@@ -670,29 +648,6 @@ class OPENBILLOW_OT_import_particles(_DomainOp):
         return {"FINISHED"}
 
 
-class OPENBILLOW_OT_install_warp(Operator):
-    bl_idname = "openbillow.install_warp"
-    bl_label = "Install GPU Engine"
-    bl_description = "Download the graphics-card library OpenBillow needs (about 105 MB). Needed once."
-
-    def execute(self, context):
-        if _install["state"] == "running":
-            return {"CANCELLED"}
-        _install.update(state="running", msg="")
-        threading.Thread(target=_install_worker, args=(deps_dir(),), daemon=True).start()
-
-        def poll():
-            if _install["state"] == "running":
-                for w in bpy.context.window_manager.windows:
-                    for a in w.screen.areas:
-                        a.tag_redraw()
-                return 1.0
-            _use_deps()
-            return None
-        bpy.app.timers.register(poll, first_interval=1.0)
-        return {"FINISHED"}
-
-
 class OPENBILLOW_OT_detect_gpu(Operator):
     bl_idname = "openbillow.detect_gpu"
     bl_label = "Detect GPU"
@@ -728,7 +683,7 @@ class OPENBILLOW_OT_set_role(Operator):
 
 
 _classes = (OPENBILLOW_OT_bake, OPENBILLOW_OT_resume, OPENBILLOW_OT_cancel, OPENBILLOW_OT_free,
-            OPENBILLOW_OT_detect_gpu, OPENBILLOW_OT_set_role, OPENBILLOW_OT_import_particles, OPENBILLOW_OT_install_warp)
+            OPENBILLOW_OT_detect_gpu, OPENBILLOW_OT_set_role, OPENBILLOW_OT_import_particles)
 
 
 def register():
