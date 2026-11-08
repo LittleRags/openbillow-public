@@ -11,6 +11,10 @@ The solver matches Mantaflow's reference scenes to within a few percent, and the
 (panels, bake, resume, cancel, presets, support, updates) works. Changes are in [CHANGELOG.md](CHANGELOG.md).
 
 
+## FAQ
+
+**Will it run on my computer?** You need Blender 4.5 or later, an NVIDIA GPU (RTX 2000 series or newer) with a recent driver, and Windows or Linux. It does not run on macOS, or on AMD or Intel GPUs: Warp needs CUDA. A 128-division smoke bake needs about 320 MB of VRAM.
+
 ## Add to Blender
 
 **From the OpenBillow repository** (Blender 4.5 or newer; Blender then offers updates itself):
@@ -36,7 +40,7 @@ Then:
    elsewhere and copy the folder over.
 
 
-An NVIDIA GPU with a recent driver is required (v1 is CUDA only). The Windows
+An NVIDIA GPU with a recent driver is required (CUDA only). The Windows
 install path has been tested on one machine (Blender 5.2, RTX 3090).
 
 ## What is free, what is paid
@@ -175,11 +179,11 @@ Each frame's `.vdb` holds these grids (half float, world-space transform):
 - `temperature`: **normalised**, not Kelvin. 0 is ambient; a flow's *Temperature*
   value is the source level, and the heat decays with cooling. Use it as a relative
   heat for colour ramps or Blackbody (scale it to taste).
+  With the *Combustion* fire model the grid is instead **Kelvin** (*Air Temperature* to
+  *Flame Temperature*) where there is heat, and 0 elsewhere; feed the grid straight to a Blackbody shader.
 - `velocity`: **metres per second, cell-centred** (the average of each cell's two
   faces), world axes. Blender's volume motion blur reads it as is. Multiply by the
   frame rate to get metres per frame; the solver's internal staggered grid is not written.
-  With the *Combustion* fire model it is instead **Kelvin** (*Air Temperature* to
-  *Flame Temperature*) where there is heat, and 0 elsewhere; feed it straight to a Blackbody shader.
 - `flame` (fire only).
 
 ## Speed
