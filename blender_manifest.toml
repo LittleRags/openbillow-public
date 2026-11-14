@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "openbillow"
-version = "0.5.4-early-access"
+version = "0.6.0-early-access"
 name = "OpenBillow"
 tagline = "GPU smoke, fire and liquid simulation for Blender"
 maintainer = "LittleRags"

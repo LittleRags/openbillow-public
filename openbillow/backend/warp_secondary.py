@@ -34,6 +34,8 @@ PDELETE = wp.constant(int(ParticleFlags.DELETE))
 PSPRAY = wp.constant(int(ParticleFlags.SPRAY))
 PBUBBLE = wp.constant(int(ParticleFlags.BUBBLE))
 PFOAM = wp.constant(int(ParticleFlags.FOAM))
+FOAM_SURFACE = wp.constant(0.5)  # realistic foam: pull to the interface, fraction of the local fluid speed
+FOAM_JITTER = wp.constant(0.35)  # realistic foam: random dispersion, fraction of the local fluid speed
 PTRACER = wp.constant(int(ParticleFlags.TRACER))
 VEPS = wp.constant(float(np.float32(1.0e-6)))  # VECTOR_EPSILON (1e-6f)
 M_PI = wp.constant(wp.float64(math.pi))
@@ -315,7 +317,8 @@ def _update_kernel(pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
                    life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32),
                    vel: wp.array4d(dtype=wp.float32), ratio: wp.array3d(dtype=wp.float32),
                    flags: wp.array3d(dtype=wp.int32), g: wp.vec3, k_b: float, k_d: float,
-                   c_s: float, c_b: float, dt: float, at_mode: int, at_steps: int):
+                   c_s: float, c_b: float, dt: float, at_mode: int, at_steps: int,
+                   foam_mode: int, seed: int):
     # knFlipUpdateSecondaryParticlesLinear (f_sec = 0). at_mode 0 = off (Blender), 2 = Mantaflow
     # antitunneling with at_steps sub-steps, 1 = per particle steps of at most half a cell.
     # The sub-step points ct/N * dt*v, ct = 1..N-1, are tested like Mantaflow does; the particle
@@ -343,7 +346,30 @@ def _update_kernel(pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
         dv = dt * v
     else:
         f = (f | PFOAM) & ~(PBUBBLE | PSPRAY)
-        dv = dt * mac_interp(vel, p)
+        u = mac_interp(vel, p)
+        if foam_mode != 0:
+            # Realistic foam (CODE-LIQ-018): air on the free surface. A drift along the neighbour-ratio
+            # gradient pulls it towards the middle of the foam band (the interface), and a random
+            # kick scaled by the local speed disperses it like turbulence. Both scale with |u|, so foam
+            # at rest stays put. Not in Mantaflow: Classic keeps the passive tracer above.
+            sh = wp.vec3i(ratio.shape[0], ratio.shape[1], ratio.shape[2])
+            ci = wp.min(wp.max(int(p[0]), 1), sh[0] - 2)
+            cj = wp.min(wp.max(int(p[1]), 1), sh[1] - 2)
+            ck = wp.min(wp.max(int(p[2]), 1), sh[2] - 2)
+            gr = wp.vec3(ratio[ci + 1, cj, ck] - ratio[ci - 1, cj, ck],
+                         ratio[ci, cj + 1, ck] - ratio[ci, cj - 1, ck],
+                         ratio[ci, cj, ck + 1] - ratio[ci, cj, ck - 1])
+            gl = wp.length(gr)
+            spd = wp.length(u)
+            mid = 0.5 * (c_s + c_b)
+            half = 0.5 * (c_b - c_s)
+            drift = wp.vec3(0.0, 0.0, 0.0)
+            if gl > 1.0e-6:
+                sg = wp.clamp((mid - nr) / half, -1.0, 1.0)
+                drift = (FOAM_SURFACE * spd * sg / gl) * gr
+            st = wp.rand_init(seed, t)
+            u = u + drift + (FOAM_JITTER * spd) * wp.sample_unit_sphere(st)
+        dv = dt * u
     if at_mode != 0:
         n = at_steps
         if at_mode == 1:
@@ -431,14 +457,16 @@ class SecondaryMixin:
         parts.n += total
 
     def update_secondary_particles(self, parts, flags, vel, neighbor_ratio, gravity, k_b, k_d, dt,
-                                   c_s=0.4, c_b=0.77, antitunneling="OFF", antitunnel_steps=4):
+                                   c_s=0.4, c_b=0.77, antitunneling="OFF", antitunnel_steps=4,
+                                   foam_realistic=False, seed=0):
         if parts.n:
             f32 = lambda x: float(np.float32(x))  # noqa: E731
             wp.launch(_update_kernel, dim=parts.n,
                       inputs=[parts.pos, parts.vel, parts.life, parts.flag, f4(vel), neighbor_ratio,
                               flags, wp.vec3(*gravity), f32(k_b), f32(k_d), f32(c_s), f32(c_b), f32(dt),
                               {"OFF": 0, "AUTO": 1, "FIXED": 2}[antitunneling],
-                              max(2, int(antitunnel_steps))],
+                              max(2, int(antitunnel_steps)), int(bool(foam_realistic)),
+                              int(seed) & 0x7fffffff],
                       device=self.device)
         self._compact(parts)
 

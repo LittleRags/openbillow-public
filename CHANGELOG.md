@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 Early Access (2026-11-14)
+
+- Presets come as Scene Packs (gas, fire, liquid). Download / Update Presets fetches the
+  packs your licence key includes, each into its own folder, and Preferences lists them.
+  A pack your key no longer includes is removed on the next download. Works with the
+  current and the upcoming preset server.
 
 - Updates and premium preset downloads are now signed: the add-on checks an Ed25519
   signature from the publisher's offline key and refuses an update or preset index that is

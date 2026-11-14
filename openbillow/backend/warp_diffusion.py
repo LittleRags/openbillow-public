@@ -103,6 +103,48 @@ def _row(flags: wp.array3d(dtype=wp.int32), s: wp.array3d(dtype=wp.vec3), a: int
     return r
 
 
+@wp.func
+def _row_gas(flags: wp.array3d(dtype=wp.int32), s: wp.array3d(dtype=wp.vec3), p: wp.vec3i,
+             alpha: float, kel: wp.array3d(dtype=wp.float32)):
+    """`_row` with use_kel for all three components at once (CODE-GAS-030): the face
+    coefficients are computed once per cell (7 Sutherland evaluations, not 72). Same
+    arithmetic in the same order."""
+    nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
+    sv = s[p[0], p[1], p[2]]
+    if (flags[p[0], p[1], p[2]] & FLUID) == 0:
+        return sv
+    tp = kel[p[0], p[1], p[2]]
+    mp = _sutherland_mu(tp)
+    mlo = wp.vec3(0.0)
+    mhi = wp.vec3(0.0)
+    for ax in range(3):
+        lo = p
+        hi = p
+        lo[ax] = lo[ax] - 1
+        hi[ax] = hi[ax] + 1
+        if lo[ax] >= 0:
+            mlo[ax] = 0.5 * (_sutherland_mu(kel[lo[0], lo[1], lo[2]]) + mp) * (287.05 / 101325.0)
+        if hi[ax] < flags.shape[ax]:
+            mhi[ax] = 0.5 * (mp + _sutherland_mu(kel[hi[0], hi[1], hi[2]])) * (287.05 / 101325.0)
+    a0 = float(1.0)
+    if (flags[p[0], p[1], p[2]] & OBSTACLE) == 0 and not border(p[0], p[1], p[2], nx, ny, nz):
+        m = float(0.0)
+        for ax in range(3):
+            m = m + mlo[ax] + mhi[ax]
+        a0 = 1.0 + alpha * tp * m
+    r = sv * a0
+    for ax in range(3):
+        lo = p
+        hi = p
+        lo[ax] = lo[ax] - 1
+        hi[ax] = hi[ax] + 1
+        if lo[ax] >= 0:
+            r = r + s[lo[0], lo[1], lo[2]] * _off(flags, lo, alpha * mlo[ax] * wp.sqrt(tp * kel[lo[0], lo[1], lo[2]]))
+        if hi[ax] < flags.shape[ax]:
+            r = r + s[hi[0], hi[1], hi[2]] * _off(flags, p, alpha * mhi[ax] * wp.sqrt(tp * kel[hi[0], hi[1], hi[2]]))
+    return r
+
+
 @wp.kernel
 def gas_kelvin_kernel(heat: wp.array3d(dtype=wp.float32), kel: wp.array3d(dtype=wp.float32),
                       ambient: float, k_per_heat: float):
@@ -130,8 +172,11 @@ def _apply_kernel(flags: wp.array3d(dtype=wp.int32), s: wp.array3d(dtype=wp.vec3
     sv = wp.vec3(0.0)
     if t < nx * ny * nz:
         p = unravel(t, ny, nz)
-        for a in range(3):
-            d[a] = _row(flags, s, a, p, alpha, kel, use_kel)
+        if use_kel != 0:
+            d = _row_gas(flags, s, p, alpha, kel)
+        else:
+            for a in range(3):
+                d[a] = _row(flags, s, a, p, alpha, kel, use_kel)
         tmp[p[0], p[1], p[2]] = d
         sv = s[p[0], p[1], p[2]]
     wp.tile_atomic_add(sc, wp.tile_sum(wp.tile(wp.float64(d[0] * sv[0]))), offset=0)
@@ -158,6 +203,29 @@ def _rhs_kernel(vel: wp.array3d(dtype=wp.vec3), x: wp.array3d(dtype=wp.vec3),
     wp.tile_atomic_add(sc, wp.tile_sum(wp.tile(wp.float64(rv[2] * rv[2]))), offset=8)
 
 
+@wp.kernel
+def _warm_kernel(vel: wp.array3d(dtype=wp.vec3), x: wp.array3d(dtype=wp.vec3),
+                 r: wp.array3d(dtype=wp.vec3), s: wp.array3d(dtype=wp.vec3),
+                 tmp: wp.array3d(dtype=wp.vec3), sc: wp.array(dtype=wp.float64)):
+    """Gas path (CODE-GAS-030): x = rhs, residual = search = rhs - A rhs (tmp = A rhs),
+    sc[3:6] = sc[6:9] = dot(r, r). The viscous step is near identity, so this starts
+    within alpha nu |Laplace w| of the answer instead of |w|."""
+    t = wp.tid()
+    nx, ny, nz = vel.shape[0], vel.shape[1], vel.shape[2]
+    rv = wp.vec3(0.0)
+    if t < nx * ny * nz:
+        p = unravel(t, ny, nz)
+        b = vel[p[0], p[1], p[2]]
+        rv = b - tmp[p[0], p[1], p[2]]
+        x[p[0], p[1], p[2]] = b
+        r[p[0], p[1], p[2]] = rv
+        s[p[0], p[1], p[2]] = rv
+    for a in range(3):
+        q = wp.tile_sum(wp.tile(wp.float64(rv[a] * rv[a])))
+        wp.tile_atomic_add(sc, q, offset=3 + a)
+        wp.tile_atomic_add(sc, q, offset=6 + a)
+
+
 class DiffusionSolver:
     """Work grids for one domain shape (4 vec3 per cell)."""
 
@@ -174,17 +242,17 @@ class DiffusionSolver:
         self._one = wp.zeros((1, 1, 1), dtype=wp.float32, device=d)  # unused kelvin grid when constant
         self.flag_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=d.is_cuda)
         self.use_graph = d.is_cuda
-        self._graph = None
+        self._graphs = {}  # chunk length -> (key, graph)
         self.n = int(np.prod(sh))
         self.padded = (self.n + BLOCK - 1) // BLOCK * BLOCK
 
     def nbytes(self) -> int:
         return sum(a.capacity for a in (self.x, self.r, self.s, self.tmp))
 
-    def _iterations(self, flags, accuracy, max_iter, kelvin):
+    def _iterations(self, flags, accuracy, max_iter, kelvin, n):
         d = self.device
         cg, uc = (self._one, 0) if kelvin is None else (kelvin, 1)
-        for _ in range(CHECK_EVERY):
+        for _ in range(n):
             wp.launch(_zero_kernel, dim=1, inputs=[self.sc], device=d)
             wp.launch(_apply_kernel, dim=self.padded, block_dim=BLOCK,
                       inputs=[flags, self.s, self.tmp, self.cst, self.sc, cg, uc], device=d)
@@ -221,21 +289,34 @@ class DiffusionSolver:
         d = self.device
         accuracy = float(np.float32(accuracy))
         max_iter = int(np.float32(max_iter_factor) * np.float32(max(self.shape)))
-        if kelvin is not None:
-            wp.launch(_scale_kernel, dim=self.shape, inputs=[vel, kelvin, -0.5], device=d)
-        self.prepare(vel, alpha)
-        key = (flags.ptr, accuracy, max_iter, None if kelvin is None else kelvin.ptr)
         done = 0
+        if kelvin is None:
+            self.prepare(vel, alpha)  # Mantaflow: x = 0 (liquid parity)
+        else:
+            # Gas (CODE-GAS-030): start from x = rhs. The viscous step is near identity for
+            # centimetre cells (alpha nu << 1), so one iteration meets the tolerance there.
+            wp.launch(_scale_kernel, dim=self.shape, inputs=[vel, kelvin, -0.5], device=d)
+            self.apply(flags, vel, self.tmp, alpha, kelvin)
+            wp.launch(_zero_kernel, dim=1, inputs=[self.sc], device=d)
+            wp.launch(_warm_kernel, dim=self.padded, block_dim=BLOCK,
+                      inputs=[vel, self.x, self.r, self.s, self.tmp, self.sc], device=d)
+            wp.launch(_init_scalars_kernel, dim=1,
+                      inputs=[self.sc, self.sig, self.act, self.iters, self.res, self.flag], device=d)
+        key = (flags.ptr, accuracy, max_iter, None if kelvin is None else kelvin.ptr)
         while done < max_iter:
+            # Gas: the warm start usually converges in one iteration, and a chunk costs its full
+            # length even after convergence, so the first chunk is a single iteration.
+            n = 1 if kelvin is not None and done == 0 else CHECK_EVERY
             if not self.use_graph:
-                self._iterations(flags, accuracy, max_iter, kelvin)
+                self._iterations(flags, accuracy, max_iter, kelvin, n)
             else:
-                if self._graph is None or self._graph[0] != key:
+                g = self._graphs.get(n)
+                if g is None or g[0] != key:
                     with wp.ScopedCapture(device=d) as cap:
-                        self._iterations(flags, accuracy, max_iter, kelvin)
-                    self._graph = (key, cap.graph)
-                wp.capture_launch(self._graph[1])
-            done += CHECK_EVERY
+                        self._iterations(flags, accuracy, max_iter, kelvin, n)
+                    g = self._graphs[n] = (key, cap.graph)
+                wp.capture_launch(g[1])
+            done += n
             wp.synchronize_device(d)
             fl = self.flag_host.numpy()
             if fl[1]:

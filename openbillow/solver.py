@@ -221,7 +221,7 @@ class DomainSettings(GuideSettings):
     # FLAME_FRONT viscosity (CODE-GAS-029): implicit diffusion of velocity once per step with the
     # kinematic viscosity of air at the local temperature (Sutherland's law, ideal gas). Keeps
     # small flames (candles) laminar; negligible at campfire scale.
-    use_viscosity: bool = False  # off by default until CODE-GAS-030 (Andre, 2026-11-13)
+    use_viscosity: bool = True
     # DIFFUSION (CODE-GAS-037; mixture fraction with eddy-dissipation fast chemistry, FDS Technical
     # Reference Guide 6.11.1 sec. 5.1-5.2.4, NIST): fuel gas enters at the emitters, burns where it
     # mixes with air at the subgrid mixing rate, and the heat it releases (less the radiated part)

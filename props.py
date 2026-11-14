@@ -103,6 +103,21 @@ class OpenBillowDomain(PropertyGroup):
                                        precision=3, description="A grid cell side that is blocked by less than this much counts as open.")
     fractions_distance: FloatProperty(name="Obstacle Distance", default=0.5, min=-5.0, max=5.0,
                                       description="How far, in grid cells, liquid is kept away from obstacles when Fractions is on.")
+    diffusion_hrrpua: FloatProperty(name="Heat Release Rate", default=1950.0, min=0.0, soft_max=3000.0,
+                                    description="Heat released per square metre of emitter footprint (its outline seen from "
+                                                "above), in kW/m2. The default is the 1 m propane pool fire of the FDS pool3d case; "
+                                                "total heat = this x footprint area")
+    diffusion_heat_of_combustion: FloatProperty(name="Heat of Combustion", default=46.007, min=0.1, soft_max=100.0,
+                                                description="Energy released per kg of fuel burned, in MJ/kg. Propane is 46")
+    diffusion_air_fuel_ratio: FloatProperty(name="Air/Fuel Ratio", default=15.592, min=0.1, soft_max=40.0,
+                                            description="Kilograms of air needed to burn 1 kg of fuel completely (stoichiometric). Propane is 15.6")
+    diffusion_radiative_fraction: FloatProperty(name="Radiative Fraction", default=0.29, min=0.0, max=0.99,
+                                                description="Share of the released heat that leaves as radiation, so it does not warm the gas. "
+                                                            "A local loss in the burning cells, not a radiation transport solve: "
+                                                "nothing is lit or heated by it")
+    diffusion_soot_yield: FloatProperty(name="Soot Yield", default=0.01, min=0.0, soft_max=0.2,
+                                        description="Kilograms of smoke made per kg of fuel burned. Propane is about 0.01, "
+                                                    "sooty fuels such as heptane 0.037")
     use_viscosity: BoolProperty(name="Viscosity", default=False,
                                 description="Makes the liquid thick and slow, like honey or lava. Takes longer to bake.")
     viscosity_value: FloatProperty(name="Strength", default=0.05, min=0.0, max=10.0, precision=4,
@@ -240,13 +255,18 @@ class OpenBillowDomain(PropertyGroup):
         ("MANTAFLOW", "Blender", "Matches Blender's own fire. Soft, blobby flames."),
         ("COMBUSTION", "Combustion", "Fuel burns only when hot enough, gives off heat, cools down and expands. Gives tongues and sharper flame tips."),
         ("FLAME_FRONT", "Flame Front (experimental)", "A sheet of fuel burns inward at a fixed speed. 3D only, "
-                        "and does not work with Noise (upres) or Guiding.")])
+                        "and does not work with Noise (upres) or Guiding."),
+        ("DIFFUSION", "Diffusion Flame (experimental)", "Fuel gas leaves the emitter and burns where it mixes with "
+                      "air (mixture fraction, as in FDS). Sized by heat output per area. Sit the emitter on "
+                      "a solid object (pan, log, ground); air drawn in under the fuel makes it flicker too "
+                      "fast. A 1 m pool puffs at 1.4-1.5 Hz, as real ones do. 3D only, "
+                      "and does not work with Noise (upres) or Guiding.")])
     flame_speed: FloatProperty(name="Burn Speed", default=0.5, min=0.1, soft_max=2.0,
                                description="How fast the flame front eats into the fuel, in m/s. A teepee about 1 m "
                                            "tall or a 1 m pool fire both look right around 1.0.")
-    use_viscosity: BoolProperty(name="Viscosity", default=False,
-                                description="Air viscosity, stronger in hot gas. Keeps small flames such as candles "
-                                            "smooth and steady; has no visible effect on large fires.")
+    use_air_viscosity: BoolProperty(name="Air Viscosity", default=True,
+                                    description="Air viscosity, stronger in hot gas. Keeps small flames such as candles "
+                                                "smooth and steady; has no visible effect on large fires.")
     fuel_kelvin: FloatProperty(name="Fuel Temperature", default=600.0, min=400.0, soft_max=900.0, subtype="TEMPERATURE", unit="TEMPERATURE",
                                description="Temperature in Kelvin of the unburned fuel gas, between Air Temperature and Flame Temperature.")
     flame_inject: FloatProperty(name="Fuel Inflow", default=0.05, min=0.0, soft_max=0.5,

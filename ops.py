@@ -120,9 +120,9 @@ def estimate_args(scene, ob, exact=False):
                 "wall_contact": d.mesh_wall_contact and d.mesh_generator != "UNION"}
     return {**kw, "fire": any(o.openbillow.flow.flow_type != "SMOKE" for o in flows),
             "noise_upres": d.noise_upres if d.use_noise else 0, "dimensions": 2 if d.use_2d else 3,
-            "guiding": d.use_guide, "combustion": d.fire_model in ("COMBUSTION", "FLAME_FRONT"),
-            "flame_front": d.fire_model == "FLAME_FRONT",
-            "gas_viscosity": d.fire_model == "FLAME_FRONT" and d.use_viscosity, "high_quality": d.quality == "HIGH"}
+            "guiding": d.use_guide, "combustion": d.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION"),
+            "flame_front": d.fire_model == "FLAME_FRONT", "mixture_fraction": d.fire_model == "DIFFUSION",
+            "gas_viscosity": d.fire_model in ("FLAME_FRONT", "DIFFUSION") and d.use_air_viscosity, "high_quality": d.quality == "HIGH"}
 
 
 def guide_children(scene, ob):
@@ -229,7 +229,8 @@ def update_volume(ob, folder, status):
             c.objects.link(vo)
         if not liquid:
             vol.materials.append(ob.openbillow.domain.material or
-                             _volume_material(ob.openbillow.domain.fire_model in ("COMBUSTION", "FLAME_FRONT")))
+                             _volume_material(ob.openbillow.domain.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION"),
+                             emission_scale(ob)))
     vol = vo.data
     first = os.path.join(folder, "vdb", "openbillow_%04d.vdb" % f0)
     if bpy.data.filepath:
@@ -327,9 +328,21 @@ def _liquid_material():
     return m
 
 
-def _material(name, smoke, flame, kelvin=False):
+EMISSION_REF_LENGTH = 1.6  # m: largest side of the Campfire domain (230x200x320 at 5 mm) the strengths were tuned on
+
+
+def emission_scale(ob):
+    """Emission factor for a domain: volume emission is per unit length, so a flame in a domain
+    smaller than the tuned Campfire one needs proportionally more. 1.0 for domains that size or larger."""
+    L = max(domain_size(ob))
+    return float("%.3g" % max(1.0, EMISSION_REF_LENGTH / L))
+
+
+def _material(name, smoke, flame, kelvin=False, scale=1.0):
     """Volume material from the bake's `density` and `flame` grids (`temperature` in K when `kelvin`,
     the Combustion model). Users can replace it."""
+    if scale != 1.0:
+        name = "%s x%g" % (name, scale)
     m = bpy.data.materials.get(name)
     if m:
         return m
@@ -352,6 +365,21 @@ def _material(name, smoke, flame, kelvin=False):
         n.inputs[1].default_value = b
         nt.links.new(a, n.inputs[0])
         return n.outputs[0]
+
+    sc = nt.nodes.new("ShaderNodeValue")  # user override of the flame brightness
+    sc.label, sc.name = "Emission scale", "Emission scale"
+    sc.outputs[0].default_value, sc.location = scale, (-600, -600)
+
+    def strength(a, k, x, y):  # a * k * Emission scale
+        n = nt.nodes.new("ShaderNodeMath")
+        n.operation, n.location = "MULTIPLY", (x, y)
+        n.inputs[1].default_value = k
+        nt.links.new(a, n.inputs[0])
+        m2 = nt.nodes.new("ShaderNodeMath")
+        m2.operation, m2.location = "MULTIPLY", (x + 180, y)
+        nt.links.new(n.outputs[0], m2.inputs[0])
+        nt.links.new(sc.outputs[0], m2.inputs[1])
+        return m2.outputs[0]
 
     shaders = []
     if smoke:  # dark grey smoke driven by density
@@ -379,7 +407,7 @@ def _material(name, smoke, flame, kelvin=False):
             mr.location = (-400, -450)
             mr.inputs["From Min"].default_value, mr.inputs["From Max"].default_value = 900.0, 1800.0
             nt.links.new(tk, mr.inputs["Value"])
-            nt.links.new(math("MULTIPLY", math("POWER", mr.outputs["Result"], 3.0, -200, -450), 20.0, 0, -450),
+            nt.links.new(strength(math("POWER", mr.outputs["Result"], 3.0, -200, -450), 20.0, 0, -450),
                          pv.inputs["Emission Strength"])
             shaders.append(pv.outputs["Volume"])
         else:
@@ -390,7 +418,7 @@ def _material(name, smoke, flame, kelvin=False):
             nt.links.new(fl, mr.inputs["Value"])
             nt.links.new(mr.outputs["Result"], pv.inputs["Temperature"])
             pv.inputs["Emission Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-            nt.links.new(math("MULTIPLY", fl, 0.1, -400, -250), pv.inputs["Emission Strength"])
+            nt.links.new(strength(fl, 0.1, -400, -250), pv.inputs["Emission Strength"])
             shaders.append(pv.outputs["Volume"])
     if len(shaders) == 2:
         add = nt.nodes.new("ShaderNodeAddShader")
@@ -402,15 +430,15 @@ def _material(name, smoke, flame, kelvin=False):
     return m
 
 
-def _volume_material(combustion=False):
+def _volume_material(combustion=False, scale=1.0):
     """Smoke + flame; also creates the separate Smoke and Flame materials to pick from.
     `combustion` reads the Kelvin `temperature` grid instead of `flame`."""
     if combustion:
-        _material("OpenBillow Combustion Flame", False, True, kelvin=True)
-        return _material("OpenBillow Combustion Fire", True, True, kelvin=True)
+        _material("OpenBillow Combustion Flame", False, True, kelvin=True, scale=scale)
+        return _material("OpenBillow Combustion Fire", True, True, kelvin=True, scale=scale)
     _material("OpenBillow Smoke", True, False)
-    _material("OpenBillow Flame", False, True)
-    return _material("OpenBillow Fire", True, True)
+    _material("OpenBillow Flame", False, True, scale=scale)
+    return _material("OpenBillow Fire", True, True, scale=scale)
 
 
 # ---- process + poll --------------------------------------------------------

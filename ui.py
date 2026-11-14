@@ -340,7 +340,15 @@ class OPENBILLOW_PT_domain_fire(_GasPanel):
             box.label(text="Flame Front (experimental)", icon="EXPERIMENTAL")
             col = box.column()
             for p in ("flame_speed", "fuel_kelvin", "flame_inject", "cooling",
-                      "flame_kelvin", "ambient_kelvin", "use_viscosity"):
+                      "flame_kelvin", "ambient_kelvin", "use_air_viscosity"):
+                col.prop(d, p)
+        elif d.fire_model == "DIFFUSION":
+            box = lay.box()
+            box.label(text="Diffusion Flame (experimental)", icon="EXPERIMENTAL")
+            col = box.column()
+            for p in ("diffusion_hrrpua", "diffusion_heat_of_combustion", "diffusion_air_fuel_ratio",
+                      "diffusion_radiative_fraction", "diffusion_soot_yield",
+                      "flame_kelvin", "ambient_kelvin", "use_air_viscosity"):
                 col.prop(d, p)
 
 

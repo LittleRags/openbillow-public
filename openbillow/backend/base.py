@@ -1027,7 +1027,8 @@ class Backend(ABC):
                                    neighbor_ratio: ScalarGrid, gravity: Vec3, k_b: float,
                                    k_d: float, dt: float, c_s: float = 0.4,
                                    c_b: float = 0.77, antitunneling: str = "OFF",
-                                   antitunnel_steps: int = 4) -> None:
+                                   antitunnel_steps: int = 4, foam_realistic: bool = False,
+                                   seed: int = 0) -> None:
         """Retype each particle by the neighbour ratio of its cell, then move it:
         spray ballistic (gravity), bubbles buoyant with drag towards the grid
         velocity, foam with the grid velocity. Life -= dt; particles outside
@@ -1036,7 +1037,10 @@ class Backend(ABC):
         'linear', scale=False, antitunneling=0)`; the force pdata is always 0.
         `antitunneling`: OFF (Blender), FIXED (Mantaflow's N = `antitunnel_steps`) or AUTO (per
         particle N = ceil(|step| / 0.5 cell) + 1, at most 16). The points ct/N of the step, ct =
-        1..N-1, are tested; a particle out of bounds or in an obstacle there is deleted."""
+        1..N-1, are tested; a particle out of bounds or in an obstacle there is deleted.
+        `foam_realistic` (High Quality, not Mantaflow): foam also drifts along the neighbour-ratio
+        gradient towards the middle of the foam band (the free surface) and gets a random kick, both
+        scaled by the local fluid speed; `seed` varies the kicks per step (CODE-LIQ-018)."""
 
     @abstractmethod
     def delete_particles_in_obstacle(self, parts: Particles, flags: FlagGrid) -> None:

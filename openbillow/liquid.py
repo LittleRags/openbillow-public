@@ -352,7 +352,8 @@ class LiquidSolver(_FrameStepper):
                                      s.sndparticle_l_max, dt, sampling=s.sndparticle_sampling)
         b.update_secondary_particles(self.snd, flags, vel, nr, self.gravity, s.sndparticle_k_b,
                                      s.sndparticle_k_d, dt, antitunneling=s.sndparticle_antitunneling,
-                                     antitunnel_steps=s.sndparticle_antitunnel_steps)
+                                     antitunnel_steps=s.sndparticle_antitunnel_steps,
+                                     foam_realistic=(s.quality == "HIGH"), seed=self.frame * 7919 + 1)
         if s.sndparticle_boundary == "PUSHOUT":
             b.push_out_of_obstacles(self.snd, self.phi_obs_sp, shift=1.0)
         b.delete_particles_in_obstacle(self.snd, flags)

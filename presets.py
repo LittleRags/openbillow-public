@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Presets. A small free base pack ships inside the add-on (`presets_base/`, listed as "(base)").
-The premium pack is not shipped: Download/Update in the
-Preferences fetches them from the Pipelineflow server with the support licence key, verifies
-each file's sha256 and keeps them in the user extension folder. The server decides who is
-entitled; the add-on enforces nothing.
+The Scene Packs (gas, fire, liquid) are not shipped: Download/Update in the
+Preferences fetches the packs the licence key owns from the Pipelineflow server, verifies
+each file's sha256 and keeps each pack in its own subfolder `<pack>/` (with its own index.json)
+of the user extension folder. The server decides who is entitled (CODE-API-024); the add-on
+enforces nothing.
 
 Preset file (`<name>.json`), format 1 (format 2 when the domain uses the COMBUSTION fire model,
-format 3 when it uses FLAME_FRONT):
+format 3 when it uses FLAME_FRONT, format 4 when it uses DIFFUSION):
     {"format": 1, "name": "Campfire", "description": "...",
      "domain": {<OpenBillowDomain property>: value, "effector_weights": {...}},
      "flow": {<OpenBillowFlow property>: value},   # applied to every Flow object in the scene
@@ -22,7 +23,7 @@ from bpy.types import Operator
 
 from . import ops
 
-FORMAT = 3  # 2: COMBUSTION fire model; 3: FLAME_FRONT (older add-ons refuse a newer format)
+FORMAT = 4  # 2: COMBUSTION fire model; 3: FLAME_FRONT; 4: DIFFUSION (older add-ons refuse a newer format)
 MATERIALS = "materials.blend"
 INDEX = "index.json"
 SKIP = {"cache_dir", "refresh_vdb", "use_scene_range", "frame_start", "frame_end", "guide_parent", "material",
@@ -61,14 +62,31 @@ def _cached(key, fn):
     return val
 
 
+def pack_id_ok(pack):
+    """A pack id usable as a folder name and dropdown prefix ("gas", "fire", "liquid", or a later one)."""
+    return (isinstance(pack, str) and 0 < len(pack) <= 32 and pack.isascii() and pack.isalnum()
+            and pack.islower() and pack + "/" != BASE)
+
+
 def installed():
-    """-> local index dict, or None when nothing is downloaded."""
+    """-> {pack: local index dict} of the downloaded packs, or None when nothing is downloaded."""
     def read():
+        root, out = folder(), {}
         try:
-            with open(os.path.join(folder(), INDEX), encoding="utf-8") as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
-            return None
+            names = sorted(os.listdir(root)) if root else []
+        except OSError:
+            names = []
+        for pack in names:
+            if not pack_id_ok(pack):
+                continue
+            try:
+                with open(os.path.join(root, pack, INDEX), encoding="utf-8") as fh:
+                    idx = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(idx, dict) and isinstance(idx.get("files"), list):
+                out[pack] = idx
+        return out or None
     return _cached("installed", read)
 
 
@@ -100,6 +118,15 @@ def _settable(group):
 FIRST = ("domain_type", "quality")
 # not reset by Apply Preset: the user's own choice (Quality) or deliberately not part of a preset
 KEEP = {"quality", "resolution_max"}
+
+
+def _migrate(listed):
+    """Gas presets saved before the air viscosity got its own property (CODE-ADD-029) list it
+    as use_viscosity, which is the liquid checkbox; a gas domain has no liquid viscosity."""
+    if listed.get("domain_type", "GAS") != "LIQUID" and "use_viscosity" in listed and "use_air_viscosity" not in listed:
+        listed = {**listed, "use_air_viscosity": listed["use_viscosity"]}
+        del listed["use_viscosity"]
+    return listed
 
 
 def _reset_unlisted(group, listed):
@@ -154,7 +181,7 @@ def capture(context, name, description=""):
     """Preset dict from the active domain and the first Flow object (for authoring the pack)."""
     ob = ops.domain_of(context)
     d = ob.openbillow.domain
-    fmt = 3 if d.fire_model == "FLAME_FRONT" else 2 if d.fire_model == "COMBUSTION" else 1
+    fmt = 4 if d.fire_model == "DIFFUSION" else 3 if d.fire_model == "FLAME_FRONT" else 2 if d.fire_model == "COMBUSTION" else 1
     preset = {"format": fmt, "name": name, "description": description,
               "domain": _capture(d)}
     flows = ops.scene_objects(context.scene, "FLOW")
@@ -169,7 +196,7 @@ def _material(name):
     m = bpy.data.materials.get(name)
     if m is not None:
         return m
-    for root in (folder(), BASE_DIR):
+    for root in [os.path.join(folder(), p) for p in (installed() or {})] + [BASE_DIR]:
         path = os.path.join(root, MATERIALS)
         if not os.path.isfile(path):
             continue
@@ -188,7 +215,7 @@ def apply(context, preset):
     ob = ops.domain_of(context)
     if ob is None:
         return 0, "Select a domain"
-    listed = preset.get("domain", {})
+    listed = _migrate(preset.get("domain", {}))
     _reset_unlisted(ob.openbillow.domain, listed)
     skipped = _assign(ob.openbillow.domain, listed)
     n = 1
@@ -224,8 +251,8 @@ def _preset_items(self, context):
     key = json.dumps([idx, base_names()], sort_keys=True)
     if key != _items["key"]:
         items = []
-        names = [BASE + n for n in base_names()] + [f["name"] for f in (idx or {}).get("files", [])
-                                                     if f["name"].endswith(".json")]
+        names = [BASE + n for n in base_names()] + [pack + "/" + f["name"] for pack, pi in (idx or {}).items()
+                                                     for f in pi["files"] if f["name"].endswith(".json")]
         for n in names:
             try:
                 p = load(n)
@@ -234,7 +261,7 @@ def _preset_items(self, context):
             label = p.get("name") or os.path.basename(n)[:-5]
             items.append((n, label + (" (base)" if n.startswith(BASE) else ""), p.get("description", "")))
         items.sort(key=lambda it: it[1])
-        _items.update(key=key, items=items or [("NONE", "No presets", "Premium presets: download in the Preferences")])
+        _items.update(key=key, items=items or [("NONE", "No presets", "Scene Packs: download in the Preferences")])
     return _items["items"]
 
 
