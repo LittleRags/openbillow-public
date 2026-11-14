@@ -32,9 +32,10 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"fuse_fp": False, "enable_backward": False})  # same float order as the C++ (CODE-LIQ-012); no adjoints (CODE-GAS-006)
+
 from .base import Flags, PressureStats
-from .warp_liquid import _sample
-from .warp_pressure import BLOCK, _border, _unravel
+from .warp_common import BLOCK, border, sample, unravel
 
 OBSTACLE = wp.constant(int(Flags.OBSTACLE))
 CHECK_EVERY = 8  # CG iterations between host-side convergence checks
@@ -89,14 +90,14 @@ def _fine_fraction(phi: wp.array3d(dtype=wp.float32), fi: int, fj: int, fk: int,
     cx = start + float(fi) * 0.5
     cy = start + float(fj) * 0.5
     cz = start + float(fk) * 0.5
-    p000 = _sample(phi, wp.vec3(cx - off, cy - off, cz - off))
-    p001 = _sample(phi, wp.vec3(cx - off, cy - off, cz + off))
-    p010 = _sample(phi, wp.vec3(cx - off, cy + off, cz - off))
-    p011 = _sample(phi, wp.vec3(cx - off, cy + off, cz + off))
-    p100 = _sample(phi, wp.vec3(cx + off, cy - off, cz - off))
-    p101 = _sample(phi, wp.vec3(cx + off, cy - off, cz + off))
-    p110 = _sample(phi, wp.vec3(cx + off, cy + off, cz - off))
-    p111 = _sample(phi, wp.vec3(cx + off, cy + off, cz + off))
+    p000 = sample(phi, wp.vec3(cx - off, cy - off, cz - off))
+    p001 = sample(phi, wp.vec3(cx - off, cy - off, cz + off))
+    p010 = sample(phi, wp.vec3(cx - off, cy + off, cz - off))
+    p011 = sample(phi, wp.vec3(cx - off, cy + off, cz + off))
+    p100 = sample(phi, wp.vec3(cx + off, cy - off, cz - off))
+    p101 = sample(phi, wp.vec3(cx + off, cy - off, cz + off))
+    p110 = sample(phi, wp.vec3(cx + off, cy + off, cz - off))
+    p111 = sample(phi, wp.vec3(cx + off, cy + off, cz + off))
     return (_frac4(p000, p001, p101, p011)
             + _frac4(p000, p101, p100, p110)
             + _frac4(p000, p010, p011, p110)
@@ -290,7 +291,7 @@ def _rhs_row(flags: wp.array3d(dtype=wp.int32), vol: wp.array4d(dtype=wp.float32
 def _row(flags: wp.array3d(dtype=wp.int32), a: int, p: wp.vec3i):
     # FOR_IJK_BND(flags, 1) and a solved face
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
-    return (not _border(p[0], p[1], p[2], nx, ny, nz)) and _solved(flags, a, p)
+    return (not border(p[0], p[1], p[2], nx, ny, nz)) and _solved(flags, a, p)
 
 
 # ---- CG (GridCg::doInit / iterate, three components in lockstep) ---------------------
@@ -309,7 +310,7 @@ def _rhs_kernel(flags: wp.array3d(dtype=wp.int32), vol: wp.array4d(dtype=wp.floa
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
     rv = wp.vec3(0.0)
     if t < nx * ny * nz:
-        p = _unravel(t, ny, nz)
+        p = unravel(t, ny, nz)
         for a in range(3):
             if _row(flags, a, p):
                 rv[a] = _rhs_row(flags, vol, vel, a, p, c2, ce)
@@ -354,7 +355,7 @@ def _apply_kernel(flags: wp.array3d(dtype=wp.int32), vol: wp.array4d(dtype=wp.fl
     d = wp.vec3(0.0)
     sv = wp.vec3(0.0)
     if t < nx * ny * nz:
-        p = _unravel(t, ny, nz)
+        p = unravel(t, ny, nz)
         for a in range(3):
             if _row(flags, a, p):
                 d[a] = _apply_row(flags, vol, s, a, p, c2, ce)
@@ -376,7 +377,7 @@ def _update_kernel(x: wp.array3d(dtype=wp.vec3), r: wp.array3d(dtype=wp.vec3),
     nx, ny, nz = x.shape[0], x.shape[1], x.shape[2]
     rv = wp.vec3(0.0)
     if t < nx * ny * nz:
-        p = _unravel(t, ny, nz)
+        p = unravel(t, ny, nz)
         xv = x[p[0], p[1], p[2]]
         rv = r[p[0], p[1], p[2]]
         sv = s[p[0], p[1], p[2]]
@@ -527,7 +528,8 @@ class ViscositySolver:
               accuracy: float = 1e-9, max_iter_factor: float = 1.5) -> PressureStats:
         """Mantaflow applyViscosity with a constant viscosity grid; dt and dx in
         Mantaflow units (dx = 1 / maxres). Stats: most iterations of the three
-        CGs and the largest final L2 residual."""
+        CGs, the largest final sum of squared residuals, and whether a component
+        stopped at the cap without reaching accuracy."""
         d = self.device
         accuracy = float(np.float32(accuracy))
         max_iter = int(np.float32(max_iter_factor) * np.float32(max(self.shape)))
@@ -551,5 +553,6 @@ class ViscositySolver:
             if not fl[0]:
                 break
         wp.launch(_apply_velocities_kernel, dim=self.shape, inputs=[flags, self.x, vel], device=d)
-        iters = self.iters.numpy()
-        return PressureStats(int(iters.max()), float(self.res.numpy().max()))
+        iters, res = self.iters.numpy(), self.res.numpy()
+        capped = bool(np.any((iters >= max_iter) & ~(res < accuracy)))
+        return PressureStats(int(iters.max()), float(res.max()), capped)

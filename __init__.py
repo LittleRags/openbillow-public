@@ -22,8 +22,8 @@ if __name__ + ".openbillow" not in sys.modules:
 from .flavor import STORE  # noqa: E402
 
 # Network modules exist only in the site build (see flavor.py).
-_NET = ("activation", "support", "presets_online", "updates", "warp_install")
-_ORDER = ("errlog", "props", "export", "ops", "diagnostics", "activation", "support", "presets", "presets_online",
+_NET = ("net", "activation", "support", "presets_online", "updates", "warp_install")
+_ORDER = ("errlog", "props", "export", "ops", "diagnostics", "net", "activation", "support", "presets", "presets_online",
           "warp_install", "updates", "ui")
 _MODS = [m for m in _ORDER if not (STORE and m in _NET)]
 if "_loaded" in locals():  # F8 reload

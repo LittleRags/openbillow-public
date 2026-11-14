@@ -66,6 +66,10 @@ class ParticleFlags(IntFlag):
     DELETE = 1 << 10  # inactive: skipped by every particle operation
 
 
+class BackendOutOfMemory(RuntimeError):
+    """A backend could not allocate device (or host) memory."""
+
+
 @dataclass
 class BackendMemory:
     total: int      # device memory, bytes
@@ -77,6 +81,7 @@ class BackendMemory:
 class PressureStats:
     iterations: int
     residual: float  # max abs divergence left after the solve
+    capped: bool = False  # viscosity only: stopped at the iteration cap without converging
 
 
 @dataclass
@@ -100,6 +105,11 @@ class Backend(ABC):
     def on_cpu(self) -> bool:
         """True when grids live in system RAM instead of on a GPU."""
         return False
+
+    @property
+    def memory_mode(self) -> str:
+        """Where the grids live: "gpu", "managed" (GPU paging through system RAM) or "cpu"."""
+        return "cpu" if self.on_cpu else "gpu"
 
     @abstractmethod
     def memory(self) -> BackendMemory:
@@ -162,7 +172,8 @@ class Backend(ABC):
     @abstractmethod
     def to_numpy(self, grid: Grid) -> np.ndarray:
         """Download: float32 (nx,ny,nz), float32 (nx,ny,nz,3) for vector and
-        MAC grids (MAC: face values, not centred), or int32 (nx,ny,nz) for flags."""
+        MAC grids (MAC: face values, not centred), or int32 (nx,ny,nz) for flags.
+        Always an independent copy: later grid operations must not change it."""
 
     @abstractmethod
     def from_numpy(self, grid: Grid, array: np.ndarray) -> None:
@@ -173,6 +184,11 @@ class Backend(ABC):
     @abstractmethod
     def sum(self, grid: ScalarGrid) -> float:
         """Sum of all cells (total density, for metrics)."""
+
+    @abstractmethod
+    def particle_sum(self, parts) -> float:
+        """Sum of every live particle's position and velocity components: NaN or infinite
+        as soon as one of them is."""
 
     @abstractmethod
     def max_abs(self, grid: ScalarGrid) -> float:
@@ -379,10 +395,14 @@ class Backend(ABC):
                 dt_seconds: float) -> None:
         """First cool all heat: heat /= 1 + dt_seconds * (cooling + cooling_radiative
         * (|heat|/max_temp)^3). Then burn fuel * (1 - exp(-burning_rate * dt)) (dt in
-        solver units), adding 0.05 * flame_smoke per unit to density; where heat was
-        >= ignition_temp before cooling, also raise heat by heat_release per unit
-        burned (capped at max_temp). expansion_div = expansion * burned / dt (pass
-        to solve_pressure as divergence_grid); 0 in the outer layer."""
+        solver units), adding 0.05 * flame_smoke per unit to density. All fuel burns at
+        that rate, but only a share r of it counts as burned for heat and expansion:
+        with t0 = heat before cooling, r = smoothstep(clamp((t0 - 0.75 * ignition_temp)
+        / (0.25 * ignition_temp), 0, 1)), i.e. 0 below 0.75 * ignition_temp and 1 at
+        ignition_temp and above (a hard switch flickers and bands). Heat is raised by
+        heat_release * r * burned (capped at max_temp); below the ramp fuel burns as
+        smoke only. expansion_div = expansion * r * burned / dt (pass to solve_pressure
+        as divergence_grid); 0 in the outer layer."""
 
     @abstractmethod
     def fire_forces(self, flags: FlagGrid, vel: MACGrid, heat: ScalarGrid, disturbance: float,
@@ -445,8 +465,12 @@ class Backend(ABC):
                        obvel: MACGrid | None = None,
                        phi: ScalarGrid | None = None,
                        divergence_grid: ScalarGrid | None = None,
-                       surface_tension: float = 0.0) -> PressureStats:
-        """With `fractions` (from `update_fractions`), the matrix and the
+                       surface_tension: float = 0.0,
+                       parallel_coarsening: bool = False,
+                       face_weights: MACGrid | None = None) -> PressureStats:
+        """`parallel_coarsening` builds the multigrid hierarchy with a GPU rule instead
+        of Mantaflow's serial one: other iteration counts, same converged answer (High
+        Quality only). With `fractions` (from `update_fractions`), the matrix and the
         divergence are weighted by the face fractions, and `obvel` adds the
         (1 - fraction) obstacle-velocity flux (Mantaflow's second-order
         obstacle boundaries). Make `vel` divergence-free: divergence, multigrid-preconditioned CG
@@ -469,7 +493,94 @@ class Backend(ABC):
         `divergence` (not in Mantaflow): target divergence of the result in
         FLUID cells, added to the rhs; < 0 compresses (liquid volume correction).
         `divergence_grid` (not in Mantaflow): the same per cell, added on top
-        (combustion gas expansion)."""
+        (combustion gas expansion).
+        `face_weights` (not in Mantaflow; not with phi): weight w of each face, laid
+        out as a MAC grid (from `density_face_weights`), or None. Solves
+        div(w grad p) = div u and subtracts w grad p (variable-density projection,
+        w = 1 / rho_face); combined with `fractions` as w * fraction in the matrix.
+        Weights may change every call, so the matrix is rebuilt on each call
+        that passes them; None keeps the constant-coefficient solve unchanged."""
+
+    @abstractmethod
+    def density_face_weights(self, heat: ScalarGrid, weights: MACGrid, ambient_kelvin: float,
+                             flame_kelvin: float, flame_max_temp: float) -> None:
+        """weights = 1 / rho_face per lower face, rho_face = (rho_lo + rho_hi) / 2,
+        rho = ambient_kelvin / T the ideal-gas density relative to ambient, T =
+        ambient_kelvin + max(heat, 0) (flame_kelvin - ambient_kelvin) / flame_max_temp.
+        Faces at index 0 use the cell's own density. For `solve_pressure(face_weights=)`."""
+
+    # ---- flame-front fire model (3D only; A6 variant C, CODE-GAS-020) ----------
+
+    @abstractmethod
+    def flame_front_step(self, flags: FlagGrid, phi_in: ScalarGrid, phi: ScalarGrid,
+                         heat: ScalarGrid, density: ScalarGrid, fuel: ScalarGrid,
+                         fuel_in: ScalarGrid, expansion_div: ScalarGrid, *, burn_cells: float,
+                         expansion_rate: float, fuel_heat: float, flame_max_temp: float,
+                         cooling: float, cooling_radiative: float, dt_seconds: float,
+                         smoke_yield: float, fuel_amount: float = 0.0, glow_cells: float = 6.0,
+                         source_gap: int = 3, band: float = 6.0,
+                         reinit_iterations: int = 2) -> None:
+        """One step of the level-set fuel core `phi` (< 0 inside, cells; Nguyen, Fedkiw
+        and Jensen 2002), after emission and before advection. Emitters are cells with
+        phi_in < 0 that are not OBSTACLE. phi is set to `band` on the border and to at most
+        -1 on emitters, burned inward by `burn_cells` (S dt in cells) in ceil(burn_cells /
+        0.5) Godunov steps, re-pinned at the emitters, reinitialised (`reinit_iterations`
+        steps, dtau 0.5) and clamped to +-band. With frac = clamp(0.5 - phi, 0, 1), burned =
+        max(frac before - frac after, 0):
+        heat: cooled as in `combust`, then at least flame_max_temp * max(burned / burn_cells,
+        clamp(1 - phi, 0, 1) on non-core cells next to the core); in the core fuel_heat at
+        emitters, else fuel_heat ramped to flame_max_temp over the `glow_cells` next to the
+        front. fuel: fuel_amount * frac when fuel_amount > 0 (one amount for all flows);
+        when 0, fuel_in at emitters and elsewhere the old fuel times min(1, frac / frac
+        before) (0 outside the core). density += smoke_yield * burned * the cell's amount.
+        expansion_div = expansion_rate * delta(phi - 1.5) * |grad phi| (cosine delta of
+        half-width 1.5 cells, product side only), 0 on the border and within `source_gap`
+        cells of an emitter."""
+
+    @abstractmethod
+    def density_lift(self, heat: ScalarGrid, lift: ScalarGrid, ambient_kelvin: float,
+                     flame_kelvin: float, flame_max_temp: float) -> None:
+        """lift = rho_amb / rho - 1 = T / ambient_kelvin - 1 (T as `density_face_weights`),
+        for `add_buoyancy(flags, vel, lift, -gravity * dt)`."""
+
+    @abstractmethod
+    def fuel_mass_source(self, flags: FlagGrid, phi_in: ScalarGrid, expansion_div: ScalarGrid,
+                         inject_cells: float) -> None:
+        """Fuel gas entering as a mass source: expansion_div += inject_cells * (faces
+        between emitter and other cells) / (emitter cells), on the emitter cells (emitters
+        as in `flame_front_step`). inject_cells is the inflow speed in cells per time unit."""
+
+    # ---- mixture-fraction fire model DIFFUSION (3D only; CODE-GAS-036, CODE-GAS-037) ----
+
+    @abstractmethod
+    def mixfrac_init(self, shape: Shape, *, dx: float, vel_scale: float, ambient_kelvin: float,
+                     kelvin_per_heat: float, heat_of_combustion: float, air_fuel_ratio: float,
+                     radiative_fraction: float, soot_yield: float, rho_gain: float = 0.3) -> Any:
+        """State of the mixture-fraction model on a 3D grid (an opaque handle for the other
+        mixfrac_* calls). It owns the transported density `.sig` = rho / rho_amb (a scalar grid,
+        1 at start; persistent: checkpoint it), the source rate grid, k_sgs and work buffers.
+        dx in m, heat_of_combustion in J/kg, air_fuel_ratio kg/kg, the fractions per unit;
+        kelvin_per_heat = (flame_kelvin - ambient_kelvin) / flame_max_temp (heat <-> K as `gas_kelvin`)."""
+
+    @abstractmethod
+    def mixfrac_source(self, state: Any, flags: FlagGrid, phi_in: ScalarGrid, hrrpua_kw_m2: float) -> None:
+        """Fuel mass source from the emitters (phi_in < 0, not OBSTACLE): per (i, j) column with
+        n emitter cells, each gets HRRPUA / (dH_c dx) / n kg/(m^3 s), so the source releases
+        HRRPUA (kW/m^2) times the emitters' footprint on the x-y plane."""
+
+    @abstractmethod
+    def mixfrac_burn(self, state: Any, flags: FlagGrid, vel: MACGrid, fuel: ScalarGrid,
+                     products: ScalarGrid, heat: ScalarGrid, smoke: ScalarGrid,
+                     expansion_div: ScalarGrid, dt_seconds: float) -> None:
+        """Source, eddy-dissipation burn, heat (written from the products), soot into `smoke`
+        and the target divergence (warp_mixfrac.MixtureFraction.burn). fuel and products are
+        the mass fractions Y_F and Y_P."""
+
+    @abstractmethod
+    def mixfrac_transport(self, state: Any, flags: FlagGrid, vel: MACGrid, fuel: ScalarGrid,
+                          products: ScalarGrid, heat: ScalarGrid, dt_seconds: float) -> int:
+        """Conservative finite-volume transport of rho, rho Y_F, rho Y_P with `vel`; rewrites
+        heat from Y_P. -> number of RK2 substeps."""
 
     @abstractmethod
     def guide_blur(self, flags: FlagGrid, vel: MACGrid, radius: int = 5,
@@ -488,7 +599,8 @@ class Backend(ABC):
                       two_d: bool = False, accuracy: float = 1e-3,
                       zero_pressure_fixing: bool = False, divergence: float = 0.0,
                       fractions: MACGrid | None = None,
-                      phi: ScalarGrid | None = None) -> GuidingStats:
+                      phi: ScalarGrid | None = None,
+                      parallel_coarsening: bool = False) -> GuidingStats:
         """Replaces `solve_pressure` when guiding: makes `vel` divergence-free
         while pulling its blurred version toward `vel_target` with per-cell
         `weight` (Blender: alpha everywhere, so it also damps the flow where
@@ -510,13 +622,30 @@ class Backend(ABC):
         Stats: most iterations of the three CGs, largest final L2 residual."""
 
     @abstractmethod
+    def apply_viscosity_coupled(self, flags: FlagGrid, phi: ScalarGrid, vel: MACGrid,
+                                viscosity: float, dt: float, dx: float) -> PressureStats:
+        """High Quality viscosity (CODE-LIQ-014): the same discrete system as
+        `apply_viscosity`, solved by one Jacobi-preconditioned CG over all three
+        components. Stats: iterations, final preconditioned relative residual,
+        and whether it stopped without converging."""
+
+    @abstractmethod
     def solve_diffusion(self, flags: FlagGrid, vel: MACGrid, alpha: float,
-                        accuracy: float = 1e-4, max_iter_factor: float = 1.0) -> PressureStats:
+                        accuracy: float = 1e-4, max_iter_factor: float = 1.0,
+                        kelvin: ScalarGrid | None = None) -> PressureStats:
         """Implicit diffusion of `vel` (liquid), Mantaflow `cgSolveDiffusion`:
         (I - alpha * Laplace) u' = u per component, applied on FLUID cells, with
         alpha = coefficient * dt / dx^2 in grid units. Un-preconditioned CG, L2
         residual < accuracy, at most int(max_iter_factor * max(shape)) iterations.
+        With `kelvin` (gas temperature in K; gas viscosity, CODE-GAS-029) it is instead the
+        variable-density viscous step of air at 1 atm, rho u' - alpha div(mu grad u') = rho u,
+        mu by Sutherland's law and rho = p / (R T), alpha = dt / dx^2 (seconds, metres).
         Stats: most iterations of the three CGs, largest final residual."""
+
+    @abstractmethod
+    def gas_kelvin(self, heat: ScalarGrid, kelvin: ScalarGrid, ambient_kelvin: float,
+                   flame_kelvin: float, flame_max_temp: float) -> None:
+        """kelvin = the FLAME_FRONT temperature T = ambient + max(heat, 0) (flame - ambient) / flame_max_temp."""
 
     # ---- noise / upres (Mantaflow plugin/waveletturbulence.cpp) ------------
     # High-res flags reuse init_domain / set_*_flags on interpolated levelsets,
@@ -585,6 +714,14 @@ class Backend(ABC):
         lifetime per particle (secondary particles)."""
 
     @abstractmethod
+    def particle_count(self, parts: Particles) -> int:
+        """Particles in use."""
+
+    @abstractmethod
+    def particle_capacity(self, parts: Particles) -> int:
+        """Particles the arrays can hold."""
+
+    @abstractmethod
     def set_particles(self, parts: Particles, pos: np.ndarray, vel: np.ndarray | None = None,
                       flag: np.ndarray | None = None, affine: np.ndarray | None = None,
                       life: np.ndarray | None = None) -> None:
@@ -595,7 +732,8 @@ class Backend(ABC):
 
     @abstractmethod
     def get_particles(self, parts: Particles) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(pos, vel, flag) of all n particles, including inactive ones."""
+        """(pos, vel, flag) of all n particles, including inactive ones.
+        Independent copies, as for to_numpy (also get_particle_affine and _life)."""
 
     @abstractmethod
     def get_particle_affine(self, parts: Particles) -> np.ndarray | None:
@@ -610,7 +748,8 @@ class Backend(ABC):
                             scale: float = 1.0) -> ParticleIndex:
         """Sort the active particles into the cells of a grid of `shape`
         (floor of pos * scale; particles outside are left out). Mantaflow
-        `gridParticleIndex`. The order inside a cell is not defined. `scale`
+        `gridParticleIndex`. Inside a cell, particles are in ascending index
+        order, so the result does not vary between runs. `scale`
         = mesh grid / particle grid size (Mantaflow `readParticles`)."""
 
     @abstractmethod
@@ -639,14 +778,36 @@ class Backend(ABC):
                                       sim_shape: tuple, radius_factor: float = 1.0,
                                       smoothen: int = 1, smoothen_neg: int = 1,
                                       scale: float = 1.0, h: float = 2.0, lam: float = 0.5,
-                                      kr: float = 4.0, nmin: int = 10) -> None:
+                                      kr: float = 4.0, nmin: int = 10,
+                                      min_half: float = 0.0) -> None:
         """Anisotropic kernels (Yu & Turk 2013), OpenBillow's High Quality mesh: each
         particle's centre is pulled `lam` of the way to its neighbours' weighted mean
         (radius `h` simulation cells, particle grid `sim_shape`), and its sphere (radius as
-        union_particle_levelset) is stretched into a same-volume ellipsoid along the
+        union_particle_levelset, so in mesh cells) is stretched into a same-volume ellipsoid along the
         neighbour covariance (axis ratio <= kr; isotropic with fewer than `nmin`
-        neighbours). phi = union of the ellipsoids, then the smoothing passes of
+        neighbours). `min_half` > 0 (mesh cells): a sheet-like ellipsoid keeps at least
+        this half-thickness, faded in from 0 where the kr limit starts to bind to full for a
+        flat sheet, so the smoothing cannot erase a one-particle film (CODE-LIQ-016); bulk
+        particles are unaffected. phi = union of the ellipsoids, then the smoothing passes of
         improved_particle_levelset; outer layer 0.5. Overwrites phi."""
+
+    @abstractmethod
+    def mirror_particles(self, parts: Particles, phi_obs: ScalarGrid, max_dist: float = 2.0,
+                         reach: float = 1.0) -> Particles:
+        """Meshing only (CODE-LIQ-015): the live particles of `parts` plus one ghost per
+        particle 0 < phi_obs < `max_dist` cells from an obstacle, mirrored across it
+        (p - 2 phi_obs n, n the phi_obs gradient as push_out_of_obstacles). A ghost is kept
+        only inside the grid's inner cells (the outer layer is the domain walls, closed by the
+        VDB writer's wall layers) and when the point `reach` cells further into the obstacle
+        is still inside it, so thin walls get no ghosts on their far side. Returns a reused
+        position/flag set (velocities are not valid), deterministic order: the originals,
+        then the ghosts in particle order. Valid until the next call."""
+
+    @abstractmethod
+    def clip_to_obstacle(self, phi: ScalarGrid, phi_obs: ScalarGrid, eps: float) -> None:
+        """phi = max(phi, -(phi_obs + eps)) with phi_obs sampled at each phi cell centre
+        (phi may be finer than phi_obs, sampled as interpolate_grid): the liquid ends `eps`
+        cells (phi_obs units) inside an obstacle. Meshing only (CODE-LIQ-015)."""
 
     @abstractmethod
     def extrapolate_ls_simple(self, phi: ScalarGrid, distance: int = 4,
@@ -739,6 +900,9 @@ class Backend(ABC):
         stream (restarted each call). May grow the capacity. Mantaflow
         `sampleLevelsetWithParticles` (no reset/refill)."""
 
+    def release_scratch(self, *names: str) -> None:
+        """Free scratch grids kept under these role names (initialisation-only grids). Default: nothing."""
+
     @abstractmethod
     def flood_fill(self, phi: ScalarGrid, boundary_width: int = 1, value: float = -0.5) -> None:
         """Mantaflow `LevelsetGrid::floodFill(value, outside=True)`: inside the
@@ -805,12 +969,18 @@ class Backend(ABC):
     @abstractmethod
     def collide_particles(self, parts: Particles, pos_old: Any, meshes: list, shape: Shape,
                           margin: float = 0.1, closed: str = "xXyYzZ", wall: float = 1.0) -> None:
-        """Improvement (not Mantaflow): exact collisions with closed obstacle
+        """Improvement (not Mantaflow): exact collisions with obstacle
         meshes (cell space, as set by `set_mesh_transform`). A particle whose
         path from `pos_old` (None: no path test) enters a mesh stops at the entry face; one inside
         or within `margin` cells of a mesh moves to the closest surface point
         plus `margin` along the outward normal. Either way the velocity part
         into the obstacle, relative to the mesh velocity there, is removed.
+        A mesh with `two_sided` set (open, not watertight, or "Is Planar")
+        has no inside: its path test stops a particle crossing either face
+        and the closest-point test only enforces the margin on the side the
+        particle is on. A closed mesh that is inside out (`orient` -1, from
+        flipped normals or a mirroring transform) is handled the same way,
+        as the grid's 26-ray rule also leaves its inside free.
         Then the domain sides in `closed` (\"xXyYzZ\", lower case = low side)
         clamp particles to [wall + margin, n - wall - margin] and zero their
         velocity into that wall (`wall` = 2 with fractions' thicker walls)."""

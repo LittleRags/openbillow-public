@@ -11,6 +11,7 @@ Noise (upres): `NoisePass`, Blender's `smoke_step_noise` after each frame.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field, replace
 
@@ -20,7 +21,7 @@ from . import estimate as _estimate
 from . import noise as _noise
 from .backend import Backend
 from .backend.base import Flags, Vec3
-from .forcefields import EffectorWeights, ForceField
+from .forcefields import EffectorWeights, ForceField, interp_matrix
 from .guiding import make_guiding
 from .meshes import cube, uv_sphere
 
@@ -29,8 +30,16 @@ FLT_EPSILON = 1.1920929e-07
 VECTOR_EPSILON = 1e-6
 
 
+class SimulationDiverged(RuntimeError):
+    """The state went to NaN or infinity in `frame` (the frame being computed)."""
+
+    def __init__(self, frame: int):
+        super().__init__(f"the simulation became unstable in frame {frame}")
+        self.frame = frame
+
+
 @dataclass
-class _MeshObject:
+class MeshObject:
     """A triangle mesh in object space plus its world matrix: one (4, 4)
     matrix, or (n, 4, 4) samples at scene times `frames` (frames, may be
     subframes), interpolated linearly and held outside the range."""
@@ -44,19 +53,11 @@ class _MeshObject:
         return np.ndim(self.matrix) == 3 and len(self.matrix) > 1
 
     def matrix_at(self, frame: float) -> np.ndarray:
-        m = np.asarray(self.matrix, float)
-        if m.ndim == 2:
-            return m
-        if len(m) == 1:
-            return m[0]
-        t = np.asarray(self.frames, float)
-        i = int(np.clip(np.searchsorted(t, frame) - 1, 0, len(t) - 2))
-        u = min(max((frame - t[i]) / (t[i + 1] - t[i]), 0.0), 1.0)
-        return m[i] + (m[i + 1] - m[i]) * u
+        return interp_matrix(self.matrix, self.frames, frame)
 
 
 @dataclass
-class MeshFlow(_MeshObject):
+class MeshFlow(MeshObject):
     """A smoke/fire source (Blender flow object, behaviour Inflow, absolute
     density, source Mesh)."""
     flow_type: str = "SMOKE"        # Blender flow type: SMOKE, FIRE or BOTH (fire + smoke)
@@ -71,7 +72,7 @@ class MeshFlow(_MeshObject):
 
 
 @dataclass
-class MeshObstacle(_MeshObject):
+class MeshObstacle(MeshObject):
     """A collision object (Blender effector, type Collision). With matrix
     samples it moves and pushes the smoke (obstacle velocity)."""
     surface_thickness: float = 0.0  # cells
@@ -93,7 +94,7 @@ def _trs(center: Vec3, scale: Vec3) -> np.ndarray:
     return m
 
 
-def _keyed(center: Vec3, scale: Vec3, center_end: Vec3 | None, frame_start: float,
+def keyed(center: Vec3, scale: Vec3, center_end: Vec3 | None, frame_start: float,
            frame_end: float, interpolation: str, samples_per_frame: int):
     """(matrix, frames): one matrix, or the location keyframed from center
     (frame_start) to center_end (frame_end) and sampled `samples_per_frame`
@@ -116,9 +117,9 @@ def SphereFlow(center: Vec3, radius: float, center_end: Vec3 | None = None,
                interpolation: str = "BEZIER", samples_per_frame: int = 4,
                **flow) -> MeshFlow:
     """Blender's default UV sphere (32 segments, 16 rings) as a flow,
-    optionally keyframed (see `_keyed`)."""
+    optionally keyframed (see `keyed`)."""
     verts, tris = uv_sphere()
-    m, frames = _keyed(center, (radius,) * 3, center_end, frame_start, frame_end,
+    m, frames = keyed(center, (radius,) * 3, center_end, frame_start, frame_end,
                        interpolation, samples_per_frame)
     return MeshFlow(verts, tris, m, frames, **flow)
 
@@ -128,9 +129,9 @@ def BoxObstacle(center: Vec3, size: Vec3, center_end: Vec3 | None = None,
                 interpolation: str = "BEZIER", samples_per_frame: int = 4,
                 **obstacle) -> MeshObstacle:
     """Blender's default cube scaled to full edge lengths `size` (metres),
-    optionally keyframed (see `_keyed`)."""
+    optionally keyframed (see `keyed`)."""
     verts, tris = cube()
-    m, frames = _keyed(center, tuple(0.5 * a for a in size), center_end, frame_start,
+    m, frames = keyed(center, tuple(0.5 * a for a in size), center_end, frame_start,
                        frame_end, interpolation, samples_per_frame)
     return MeshObstacle(verts, tris, m, frames, **obstacle)
 
@@ -206,6 +207,34 @@ class DomainSettings(GuideSettings):
     disturbance_size: float = 0.1      # m, size of the random blocks
     disturbance_rate: float = 4.0      # 1/s, how often the pattern changes
     shredding: float = 0.0             # 1/s, tears the flame edge along the heat gradient
+    # FLAME_FRONT (ours, not Mantaflow; research A6 variant C, Nguyen, Fedkiw and Jensen
+    # 2002): COMBUSTION's cooling, disturbance and output, but the fuel is a level-set core
+    # that burns inward at flame_speed; heat and smoke come from the front, the gas
+    # expands across it, and buoyancy and the pressure solve use the ideal-gas density.
+    # 3D only; no noise or guiding.
+    flame_speed: float = 0.5           # m/s, burn speed of the front (Nguyen 2002)
+    fuel_kelvin: float = 600.0         # K, fuel gas; density jump flame_kelvin / fuel_kelvin
+    flame_inject: float = 0.05         # m/s, fuel gas inflow through the emitter outline
+    flame_glow_cells: float = 6.0      # cells of fuel-side glow inside the front
+    flame_source_gap: int = 3          # cells round emitters without expansion
+    flame_smoke_yield: float = 0.0022  # smoke per unit of fuel burned (times flame_smoke)
+    # FLAME_FRONT viscosity (CODE-GAS-029): implicit diffusion of velocity once per step with the
+    # kinematic viscosity of air at the local temperature (Sutherland's law, ideal gas). Keeps
+    # small flames (candles) laminar; negligible at campfire scale.
+    use_viscosity: bool = False  # off by default until CODE-GAS-030 (Andre, 2026-11-13)
+    # DIFFUSION (CODE-GAS-037; mixture fraction with eddy-dissipation fast chemistry, FDS Technical
+    # Reference Guide 6.11.1 sec. 5.1-5.2.4, NIST): fuel gas enters at the emitters, burns where it
+    # mixes with air at the subgrid mixing rate, and the heat it releases (less the radiated part)
+    # sets the temperature; the fuel and react grids hold the fuel and product mass fractions.
+    # Buoyancy and the pressure solve use the ideal-gas density as FLAME_FRONT; COMBUSTION's
+    # disturbance, shredding and flame vorticity do not apply. use_viscosity applies as for
+    # FLAME_FRONT. 3D only; no noise or guiding. Defaults: the FDS pool3d propane pool (1950 kW
+    # on 1 m^2; reaction constants from FDS 6.11.1 pool3d.out, soot yield from its input).
+    diffusion_hrrpua: float = 1950.0              # kW/m^2 of emitter footprint (x-y plane)
+    diffusion_heat_of_combustion: float = 46.007  # MJ/kg
+    diffusion_air_fuel_ratio: float = 15.592      # kg air per kg fuel (stoichiometric)
+    diffusion_radiative_fraction: float = 0.29    # share of the heat lost to radiation
+    diffusion_soot_yield: float = 0.01            # kg soot (smoke) per kg fuel burned
     # Sides without border collision ("xXyYzZ", lower case = low side).
     # Blender's gas domain default is all sides open.
     outflow: str = "xXyYzZ"
@@ -230,6 +259,11 @@ class DomainSettings(GuideSettings):
     force_fields: list[ForceField] = field(default_factory=list)
     effector_weights: EffectorWeights = field(default_factory=EffectorWeights)
 
+    def validate(self) -> None:
+        """Raise ValueError naming the first bad field."""
+        from .validate import gas
+        gas(self)
+
     def estimate_kwargs(self) -> dict:
         """Keyword extras for estimate.* (obstacles, fire, noise upres, ...)."""
         return {"has_obstacles": bool(self.obstacles),
@@ -237,7 +271,11 @@ class DomainSettings(GuideSettings):
                 "fire": any(f.flow_type != "SMOKE" for f in self.flows),
                 "noise_upres": int(self.noise_upres) if self.use_noise else 0,
                 "dimensions": self.dimensions, "force_fields": bool(self.force_fields),
-                "guiding": self.use_guide, "combustion": self.fire_model == "COMBUSTION",
+                "guiding": self.use_guide,
+                "combustion": self.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION"),
+                "flame_front": self.fire_model == "FLAME_FRONT",
+                "mixture_fraction": self.fire_model == "DIFFUSION",
+                "gas_viscosity": self.fire_model in ("FLAME_FRONT", "DIFFUSION") and self.use_viscosity,
                 "high_quality": self.quality == "HIGH"}
 
 
@@ -251,7 +289,110 @@ class FrameStats:
     guide_iters: list[int] = field(default_factory=list)  # PD iterations per substep
 
 
-class SmokeSolver:
+@dataclass(frozen=True)
+class Units:
+    """Solver units of a domain (fluid_script.h / MANTA_main.cpp)."""
+    domain_size: float
+    dx: float
+    shape: tuple
+    frame_length: float
+    res_per_m: float
+    vel_scale: float   # m/s -> cells per solver time
+    scale_acc: float   # m/s^2 -> solver units
+    gravity: tuple
+    dt_min: float
+    dt_max: float
+
+    @classmethod
+    def from_settings(cls, s, round_frame_length: bool = False) -> "Units":
+        """round_frame_length: Blender hands the liquid frame length to Mantaflow as std::to_string
+        (6 decimals, 0.104167 at 24 fps); the gas value is not rounded."""
+        domain_size = max(s.size)
+        frame_length = DT_DEFAULT * (25.0 / s.fps) * s.time_scale
+        if round_frame_length:
+            frame_length = float(f"{frame_length:f}")
+        res_per_m = s.resolution_max / domain_size
+        scale_acc = res_per_m * (1.0 / (DT_DEFAULT * 25.0)) ** 2
+        return cls(domain_size, domain_size / s.resolution_max, _estimate.grid_shape(s.size, s.resolution_max),
+                   frame_length, res_per_m, res_per_m / (25.0 * DT_DEFAULT), scale_acc,
+                   tuple(g * scale_acc for g in s.gravity),
+                   frame_length / max(1, s.timesteps_max), frame_length / max(1, s.timesteps_min))
+
+
+class _FrameStepper:
+    """The frame loop and time stepping both solvers share (Blender `manta_step`, FluidSolver::step).
+    Subclasses provide `_substep(dt)` and `_after_frame`, and may hook the other two."""
+
+    def _before_frame(self) -> None:
+        pass
+
+    def _before_substep(self) -> None:
+        pass
+
+    def _after_substep(self) -> None:
+        pass
+
+    def step_frame(self):
+        """Advance one Blender frame."""
+        t0 = time.perf_counter()
+        dts, iters, pd_iters = [], [], []
+        t = 0.0
+        self._before_frame()
+        if self.guiding:
+            self.guiding.update_frame(self.frame + 1)
+        while t + FLT_EPSILON < self.frame_length:
+            self._adapt_timestep(self.b.max_velocity(self.vel))
+            self._before_substep()
+            it, pd = self._substep(self.dt)
+            iters.append(it)
+            if pd is not None:
+                pd_iters.append(pd)
+            dts.append(self.dt)
+            t += self.dt
+            self._after_substep()
+            # FluidSolver::step
+            self.time_per_frame += self.dt
+            if self.time_per_frame + VECTOR_EPSILON > self.frame_length:
+                self.time_per_frame = 0.0
+                self.lock_dt = False
+        return self._after_frame(t0, dts, iters, pd_iters)
+
+    def _adapt_timestep(self, max_vel: float) -> None:
+        """Mantaflow `FluidSolver::adaptTimestep`."""
+        if not math.isfinite(max_vel):
+            raise SimulationDiverged(self.frame + 1)
+        if self.lock_dt:
+            return
+        mvt = max_vel * self.dt
+        dt = max(min(self.dt * (self.s.cfl / (mvt + 1e-05)), self.dt_max), self.dt_min)
+        rest = self.frame_length - self.time_per_frame
+        if self.time_per_frame + dt * 1.05 > self.frame_length:
+            dt = rest + 1e-04
+        elif (self.time_per_frame + dt + self.dt_min > self.frame_length
+              or self.time_per_frame + dt * 1.25 > self.frame_length):
+            dt = (rest + 1e-04) * 0.5
+            self.lock_dt = True
+        self.dt = dt
+
+    def _check_finite(self, field, extra: float = 0.0) -> None:
+        """Raise SimulationDiverged if `field`, the pressure or `extra` holds NaN or infinity.
+        Sums, because a single reduction per grid propagates both."""
+        probe = self.b.sum(field) + self.b.sum(self.pressure) + extra
+        if not (math.isfinite(probe) and math.isfinite(self.dt)):
+            raise SimulationDiverged(self.frame + 1)
+
+    def _flow_time(self, dt: float) -> float:
+        """Scene time (frames) at which Blender evaluates flows for a substep
+        (fluid.cc `update_flowsfluids`, flow subframes = 0): the substep's end
+        time, i.e. the frame being baked on its last substep and on the first
+        frame."""
+        frame = self.frame + 1
+        if frame > self.frame_start and self.time_per_frame + dt + FLT_EPSILON < self.frame_length:
+            return frame - 1 + min((self.time_per_frame + dt) / self.frame_length, 1.0)
+        return float(frame)
+
+
+class SmokeSolver(_FrameStepper):
     def __init__(self, backend: Backend, settings: DomainSettings, frame_start: int = 1):
         self.b = backend
         self.dim2 = settings.dimensions == 2
@@ -266,21 +407,14 @@ class SmokeSolver:
         self.s = s = settings
 
         # Units (fluid_script.h / MANTA_main.cpp).
-        self.domain_size = max(s.size)
-        self.dx = self.domain_size / s.resolution_max
-        self.shape = tuple(max(3, int(n / self.dx + 0.5)) for n in s.size)
-        self.frame_length = DT_DEFAULT * (25.0 / s.fps) * s.time_scale
+        u = Units.from_settings(s)
+        self.domain_size, self.dx, self.shape, self.frame_length = u.domain_size, u.dx, u.shape, u.frame_length
         self.frame_length_unscaled = self.frame_length / s.time_scale
-        res_per_m = s.resolution_max / self.domain_size
-        scale_acc = res_per_m * (1.0 / (DT_DEFAULT * 25.0)) ** 2
-        self.vel_scale = res_per_m / (25.0 * DT_DEFAULT)   # m/s -> cells per solver time
-        self.scale_acc = scale_acc   # m/s^2 -> solver units
-        self.gravity = tuple(g * scale_acc for g in s.gravity)
+        self.vel_scale, self.scale_acc, self.gravity = u.vel_scale, u.scale_acc, u.gravity
         self.buoy_dens = s.alpha / self.domain_size
         self.buoy_heat = s.beta / self.domain_size
         self.domain_closed = s.outflow == ""
-        self.dt_min = self.frame_length / max(1, s.timesteps_max)
-        self.dt_max = self.frame_length / max(1, s.timesteps_min)
+        self.dt_min, self.dt_max = u.dt_min, u.dt_max
 
         # Grids.
         b, sh = self.b, self.shape
@@ -306,10 +440,38 @@ class SmokeSolver:
             self.flame = b.scalar_grid(sh)
             self.fuel_in = b.scalar_grid(sh)
             self.react_in = b.scalar_grid(sh)
-        if s.fire_model not in ("MANTAFLOW", "COMBUSTION"):
-            raise ValueError(f"fire_model must be MANTAFLOW or COMBUSTION, not {s.fire_model!r}")
-        self.combustion = self.fire and s.fire_model == "COMBUSTION"
+        if s.fire_model not in ("MANTAFLOW", "COMBUSTION", "FLAME_FRONT", "DIFFUSION"):
+            raise ValueError("fire_model must be MANTAFLOW, COMBUSTION, FLAME_FRONT or DIFFUSION, "
+                             f"not {s.fire_model!r}")
+        # FLAME_FRONT shares COMBUSTION's cooling, disturbance, flame update and output; DIFFUSION
+        # shares its expansion grid, flame update and Kelvin output, and FLAME_FRONT's ideal-gas
+        # buoyancy, 1/rho projection and viscosity (`ideal_gas`).
+        self.flame_front = self.fire and s.fire_model == "FLAME_FRONT"
+        self.diffusion = self.fire and s.fire_model == "DIFFUSION"
+        self.ideal_gas = self.flame_front or self.diffusion
+        self.combustion = self.fire and s.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION")
         self.expansion_div = b.scalar_grid(sh) if self.combustion else None
+        self.phi_flame = self.mixfrac = None
+        if self.ideal_gas:
+            if self.dim2:
+                raise ValueError(f"fire_model {s.fire_model} is 3D only")
+            self.lift = b.scalar_grid(sh)
+            self.face_weights = b.mac_grid(sh)
+            self.kelvin = b.scalar_grid(sh) if s.use_viscosity else None
+        if self.diffusion:
+            self.mixfrac = b.mixfrac_init(
+                sh, dx=self.dx, vel_scale=self.vel_scale, ambient_kelvin=s.ambient_kelvin,
+                kelvin_per_heat=(s.flame_kelvin - s.ambient_kelvin) / s.flame_max_temp,
+                heat_of_combustion=s.diffusion_heat_of_combustion * 1e6,
+                air_fuel_ratio=s.diffusion_air_fuel_ratio, radiative_fraction=s.diffusion_radiative_fraction,
+                soot_yield=s.diffusion_soot_yield)
+        if self.flame_front:
+            self.phi_flame = b.scalar_grid(sh, 6.0)  # fuel core < 0, cells; +-6 band
+            self.flame_speed_c = s.flame_speed * self.vel_scale
+            self.flame_inject_c = s.flame_inject * self.vel_scale
+            self.fuel_heat = ((s.fuel_kelvin - s.ambient_kelvin) / (s.flame_kelvin - s.ambient_kelvin)
+                              * s.flame_max_temp)
+            self.flame_jump = s.flame_kelvin / s.fuel_kelvin - 1.0  # rho_fuel / rho_hot - 1
         # Meshes. world → cell = Blender manta_pos_to_cell (cell centres at
         # index + 0.5). Static objects get their transform once.
         self.world_to_cell = np.diag([1.0 / self.dx] * 3 + [1.0])
@@ -360,46 +522,19 @@ class SmokeSolver:
 
     # ---- time stepping -----------------------------------------------------
 
-    def _adapt_timestep(self, max_vel: float) -> None:
-        """Mantaflow `FluidSolver::adaptTimestep`."""
-        if self.lock_dt:
-            return
-        mvt = max_vel * self.dt
-        dt = max(min(self.dt * (self.s.cfl / (mvt + 1e-05)), self.dt_max), self.dt_min)
-        rest = self.frame_length - self.time_per_frame
-        if self.time_per_frame + dt * 1.05 > self.frame_length:
-            dt = rest + 1e-04
-        elif (self.time_per_frame + dt + self.dt_min > self.frame_length
-              or self.time_per_frame + dt * 1.25 > self.frame_length):
-            dt = (rest + 1e-04) * 0.5
-            self.lock_dt = True
-        self.dt = dt
+    def _before_frame(self) -> None:
+        self._time_total_old = self.time_total
 
-    def step_frame(self) -> FrameStats:
-        """Advance one Blender frame (Blender `manta_step`)."""
-        t0 = time.perf_counter()
-        dts, iters, pd_iters = [], [], []
-        t = 0.0
-        time_total_old = self.time_total
-        if self.guiding:
-            self.guiding.update_frame(self.frame + 1)
-        while t + FLT_EPSILON < self.frame_length:
-            self._adapt_timestep(self.b.max_velocity(self.vel))
-            self.time_last_substep = self.time_total
-            it, pd = self._substep(self.dt)
-            iters.append(it)
-            if pd is not None:
-                pd_iters.append(pd)
-            dts.append(self.dt)
-            t += self.dt
-            self.time_total = np.float32(self.time_total + np.float32(self.dt))
-            # FluidSolver::step
-            self.time_per_frame += self.dt
-            if self.time_per_frame + VECTOR_EPSILON > self.frame_length:
-                self.time_per_frame = 0.0
-                self.lock_dt = False
+    def _before_substep(self) -> None:
+        self.time_last_substep = self.time_total
+
+    def _after_substep(self) -> None:
+        self.time_total = np.float32(self.time_total + np.float32(self.dt))
+
+    def _after_frame(self, t0, dts, iters, pd_iters) -> FrameStats:
         self.time_total = min(self.time_total,
-                              np.float32(time_total_old + np.float32(self.frame_length)))
+                              np.float32(self._time_total_old + np.float32(self.frame_length)))
+        self._check_finite(self.density)
         self.frame += 1
         if self.noise:
             self.noise.step()
@@ -420,8 +555,11 @@ class SmokeSolver:
         if not self.combustion:
             return h
         s = self.s
-        k = s.ambient_kelvin + h * ((s.flame_kelvin - s.ambient_kelvin) / s.flame_max_temp)
-        return np.where(h > 1e-6, k, 0.0).astype(np.float32)
+        cold = ~(h > 1e-6)
+        h *= (s.flame_kelvin - s.ambient_kelvin) / s.flame_max_temp  # h is our own download
+        h += s.ambient_kelvin
+        h[cold] = 0.0
+        return h
 
     def guide_velocity(self, clip: float = 1e-6) -> np.ndarray:
         """MAC velocity for child domains (guide source DOMAIN): what Blender's
@@ -449,16 +587,25 @@ class SmokeSolver:
         if self.fire:
             st["fuel"] = b.to_numpy(self.fuel)
             st["react"] = b.to_numpy(self.react)
+        if self.flame_front:
+            st["phi_flame"] = b.to_numpy(self.phi_flame)
+        if self.diffusion:  # fuel and react hold Y_F and Y_P; sig is the transported density
+            st["mixfrac_sig"] = b.to_numpy(self.mixfrac.sig)
         if self.noise:
             st.update(self.noise.save_state())
         return st
 
     def load_state(self, st) -> None:
         b = self.b
-        for k in ("vel", "density", "heat") + (("fuel", "react") if self.fire else ()):
+        for k in (("vel", "density", "heat") + (("fuel", "react") if self.fire else ())
+                  + (("phi_flame",) if self.flame_front else ())
+                  + (("mixfrac_sig",) if self.diffusion else ())):
+            if k not in st:
+                raise ValueError(f"checkpoint has no {k} (baked with another fire model?)")
             if tuple(st[k].shape[:3]) != self.shape:
                 raise ValueError(f"checkpoint {k} shape {st[k].shape} != grid {self.shape}")
-            b.from_numpy(getattr(self, k), np.asarray(st[k], np.float32))
+            grid = self.mixfrac.sig if k == "mixfrac_sig" else getattr(self, k)
+            b.from_numpy(grid, np.asarray(st[k], np.float32))
         self.frame = int(st["frame"])
         self.dt = float(st["dt"])
         self.time_per_frame = float(st["time_per_frame"])
@@ -481,16 +628,6 @@ class SmokeSolver:
 
     # ---- one substep -------------------------------------------------------
 
-    def _flow_time(self, dt: float) -> float:
-        """Scene time (frames) at which Blender evaluates flows for a substep
-        (fluid.cc `update_flowsfluids`, flow subframes = 0): the substep's end
-        time, i.e. the frame being baked on its last substep and on the first
-        frame."""
-        frame = self.frame + 1
-        if frame > self.frame_start and self.time_per_frame + dt + FLT_EPSILON < self.frame_length:
-            return frame - 1 + min((self.time_per_frame + dt) / self.frame_length, 1.0)
-        return float(frame)
-
     def _rasterize_flows(self, t: float) -> None:
         """Blender `update_flowsfluids` at scene time t: phi_in, emission_in, density_in,
         heat_in (and fuel_in, react_in with fire). The *_in grids start as copies
@@ -506,7 +643,7 @@ class SmokeSolver:
             b.copy(self.fuel_in, self.fuel)
             b.copy(self.react_in, self.react)
         for f, m in zip(self.s.flows, self._flow_meshes):
-            if f.emit_end and not (f.emit_start - 1 <= t < f.emit_end):
+            if f.emit_end and not (f.emit_start - 1 < t <= f.emit_end):
                 continue
             if f.animated:
                 b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(t))
@@ -540,17 +677,23 @@ class SmokeSolver:
             self.noise.substep_start()
         if self._moving:
             self._rasterize_moving_obstacles(t, dt)
-        forces = _update_forces(self, t, self.density, self.fuel)
+        forces = update_forces(self, t, self.density, self.fuel)
         b.init_domain(flags, boundary_width=0, outflow=s.outflow)
         b.set_inflow_flags(flags, self.phi_in)
         if self.phi_obs is not None:
             b.set_obstacle_flags(flags, self.phi_obs)
         b.apply_emission(flags, self.density, self.density_in, self.emission_in)
         b.apply_emission(flags, self.heat, self.heat_in, self.emission_in)
-        if self.fire:
+        if self.diffusion:  # fuel and react are Y_F and Y_P: the source enters as mass, not by emission
+            b.mixfrac_source(self.mixfrac, flags, self.phi_in, s.diffusion_hrrpua)
+            b.mixfrac_burn(self.mixfrac, flags, vel, self.fuel, self.react, self.heat, self.density,
+                           self.expansion_div, scale / s.fps)
+        elif self.fire:
             b.apply_emission(flags, self.fuel, self.fuel_in, self.emission_in)
             b.apply_emission(flags, self.react, self.react_in, self.emission_in)
-            if self.combustion:
+            if self.flame_front:
+                self._flame_front_step(dt, scale / s.fps)
+            elif self.combustion:
                 b.combust(self.fuel, self.density, self.heat, self.expansion_div, s.burning_rate,
                           s.flame_ignition, s.flame_max_temp, s.heat_release, s.flame_smoke,
                           s.cooling, s.cooling_radiative, s.expansion, dt,
@@ -595,11 +738,30 @@ class SmokeSolver:
 
     def _advect_scalars(self, dt: float) -> None:
         b, flags, vel = self.b, self.flags, self.vel
+        if self.diffusion:  # species and density conservatively (heat follows Y_P); smoke as usual
+            b.mixfrac_transport(self.mixfrac, flags, vel, self.fuel, self.react, self.heat,
+                                dt / self.frame_length_unscaled / self.s.fps)
+            b.advect(flags, vel, self.density, dt)
+            return
         b.advect(flags, vel, self.density, dt)
         b.advect(flags, vel, self.heat, dt)
         if self.fire:
             b.advect(flags, vel, self.fuel, dt)
             b.advect(flags, vel, self.react, dt)
+        if self.flame_front:
+            b.advect(flags, vel, self.phi_flame, dt)
+
+    def _flame_front_step(self, dt: float, dt_seconds: float) -> None:
+        """FLAME_FRONT in place of `combust`: burn the level-set fuel core, heat, smoke and
+        fuel from the front, and the expansion source (research A6 variant C)."""
+        s = self.s
+        self.b.flame_front_step(
+            self.flags, self.phi_in, self.phi_flame, self.heat, self.density, self.fuel, self.fuel_in,
+            self.expansion_div, burn_cells=self.flame_speed_c * dt,
+            expansion_rate=self.flame_jump * self.flame_speed_c, fuel_heat=self.fuel_heat,
+            flame_max_temp=s.flame_max_temp, cooling=s.cooling, cooling_radiative=s.cooling_radiative,
+            dt_seconds=dt_seconds, smoke_yield=s.flame_smoke_yield * s.flame_smoke,
+            glow_cells=s.flame_glow_cells, source_gap=int(s.flame_source_gap))
 
     def _after_advect(self) -> None:
         b = self.b
@@ -612,41 +774,61 @@ class SmokeSolver:
 
     def _add_forces(self, t: float, dt: float, scale: float, forces: bool) -> None:
         b, s, flags, vel = self.b, self.s, self.flags, self.vel
-        if self.fire:
+        if self.fire and not self.diffusion:
             # Flame vorticity: per-cell strength fuel * flame_vorticity * scale,
             # applied even when the domain vorticity is 0.
             b.vorticity_confinement(flags, vel, s.vorticity * scale, self.fuel,
                                     s.flame_vorticity * scale)
         elif s.vorticity:
             b.vorticity_confinement(flags, vel, s.vorticity * scale)
-        if self.combustion:
+        if self.combustion and not self.diffusion:
             b.fire_forces(flags, vel, self.heat, s.disturbance * self.scale_acc * dt,
                           s.disturbance_size / self.dx, t / s.fps * s.disturbance_rate,
                           s.flame_ignition, s.shredding * scale / s.fps, s.flame_max_temp)
         g = self.gravity
-        b.add_buoyancy(flags, vel, self.heat,
-                       tuple(-gi * dt * self.buoy_heat for gi in g))
+        if self.ideal_gas:  # ideal-gas buoyancy g (rho_amb / rho - 1) in place of beta * heat
+            b.density_lift(self.heat, self.lift, s.ambient_kelvin, s.flame_kelvin, s.flame_max_temp)
+            b.add_buoyancy(flags, vel, self.lift, tuple(-gi * dt for gi in g))
+        else:
+            b.add_buoyancy(flags, vel, self.heat,
+                           tuple(-gi * dt * self.buoy_heat for gi in g))
         b.add_buoyancy(flags, vel, self.density,
                        tuple(-gi * dt * self.buoy_dens for gi in g))
         if forces:
-            b.add_force_field(flags, vel, self.forces, _force_scale(self))
+            b.add_force_field(flags, vel, self.forces, force_scale(self))
+        if self.flame_front and self.flame_inject_c:
+            # Fuel gas enters as a mass source (a velocity set in the emitter is undone by the projection).
+            b.fuel_mass_source(flags, self.phi_in, self.expansion_div, self.flame_inject_c)
 
     def _project(self, final: bool) -> tuple[int, int | None]:
         """Wall BCs and the pressure solve (guided only when `final`); the flame update
         after the final one. -> (CG iterations, PD iterations or None)."""
         b, s, flags, vel = self.b, self.s, self.flags, self.vel
+        if final and self.ideal_gas and self.kelvin is not None:
+            # Viscosity (CODE-GAS-029): rho u' - dt_s div(mu grad u') = rho u in grid units,
+            # alpha = dt_s / dx^2 = vel_scale dt / dx (dt_s = vel_scale dt dx), dx in metres.
+            b.gas_kelvin(self.heat, self.kelvin, s.ambient_kelvin, s.flame_kelvin, s.flame_max_temp)
+            b.solve_diffusion(flags, vel, self.vel_scale * self.dt / self.dx, kelvin=self.kelvin)
         b.set_wall_bcs(flags, vel, self.obvel)
         if self.dim2:
             b.mirror_slab(vel)  # drops y face velocities the obstacle BCs may set
         pd = None
         if self.guiding and final:
             gst = self.guiding.solve(flags, vel, self.pressure, accuracy=s.cg_accuracy,
-                                     zero_pressure_fixing=self.domain_closed)
+                                     zero_pressure_fixing=self.domain_closed,
+                                     parallel_coarsening=s.quality == "HIGH")
             it, pd = gst.pressure_iterations, gst.iterations
         else:
+            weights = None
+            if self.ideal_gas:  # variable-density projection, w = 1 / rho_face
+                b.density_face_weights(self.heat, self.face_weights, s.ambient_kelvin, s.flame_kelvin,
+                                       s.flame_max_temp)
+                weights = self.face_weights
             it = b.solve_pressure(flags, vel, self.pressure, accuracy=s.cg_accuracy,
                                   zero_pressure_fixing=self.domain_closed,
-                                  divergence_grid=self.expansion_div).iterations
+                                  divergence_grid=self.expansion_div,
+                                  parallel_coarsening=s.quality == "HIGH",
+                                  face_weights=weights).iterations
         if self.dim2:
             b.mirror_slab(vel)
         if final and self.combustion:
@@ -656,7 +838,7 @@ class SmokeSolver:
         return it, pd
 
 
-def _update_forces(sol, t, density=None, fuel=None) -> bool:
+def update_forces(sol, t, density=None, fuel=None) -> bool:
     """Blender's update_effectors into `sol.forces` (allocated on first use); False when
     no field acts. t is the scene time of the substep. Called at the substep start, before the flags are rebuilt."""
     s = sol.s
@@ -670,7 +852,7 @@ def _update_forces(sol, t, density=None, fuel=None) -> bool:
                                 phi_obs=sol.phi_obs)
 
 
-def _force_scale(sol) -> float:
+def force_scale(sol) -> float:
     """scaleSpeedFrames: forces are in blength/frame, the grid in cells/frameLength."""
     return sol.s.resolution_max / sol.domain_size / (sol.frame_length / sol.s.time_scale)
 

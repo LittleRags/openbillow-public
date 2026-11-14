@@ -21,12 +21,25 @@ import numpy as np
 
 try:
     import openvdb as vdb
-except ImportError:  # Blender's Python keeps it in site-packages, which -I hides
-    sys.path += glob.glob(sys.base_prefix + "/lib/python3*/site-packages")
+except ImportError:  # fallback if a Python keeps openvdb in its own site-packages (Linux lib/, Windows Lib/)
+    sys.path += glob.glob(sys.base_prefix + "/[lL]ib/python3*/site-packages") + [sys.base_prefix + "/Lib/site-packages"]
     import openvdb as vdb
 
 
+def _read(src):
+    """A grid given as an array, or as a callable that downloads it only when the writer gets
+    to it, as float32 for reading. Callables keep at most one big grid on the host at a time."""
+    return np.ascontiguousarray(src() if callable(src) else src, np.float32)
+
+
+def _owned(src):
+    """As `_read`, for an array the writer overwrites: what a callable returns is the writer's
+    own, an array passed in stays the caller's and is copied once."""
+    return _read(src) if callable(src) else np.array(src, np.float32, order="C")
+
+
 def _grid(cls, name, arr, transform, meta, clip, mask=None):
+    """With a mask (vector grid) `arr` is overwritten: zeros outside the mask."""
     g = cls()
     g.name = name
     g.transform = transform
@@ -34,8 +47,9 @@ def _grid(cls, name, arr, transform, meta, clip, mask=None):
     if mask is None:
         g.copyFromArray(arr, ijk=(0, 0, 0), tolerance=clip)
     else:  # vector grid: active where the mask is, zeros elsewhere
-        g.copyFromArray(np.where(mask[..., None], arr, 0.0).astype(np.float32),
-                        ijk=(0, 0, 0), tolerance=(0.0, 0.0, 0.0))
+        # not arr[~mask] = 0: a 3D mask on a 4D array expands to 24 bytes of indices per cell
+        np.copyto(arr, 0.0, where=~mask[..., None])
+        g.copyFromArray(arr, ijk=(0, 0, 0), tolerance=(0.0, 0.0, 0.0))
     for k, v in meta.items():
         g[k] = v
     return g
@@ -44,15 +58,17 @@ def _grid(cls, name, arr, transform, meta, clip, mask=None):
 def cell_centred_mps(vel, vel_scale):
     """MAC face velocity (nx,ny,nz,3, solver units) -> cell-centred m/s: the mean of a
     cell's low and high face (the last cell keeps its low face), divided by vel_scale
-    (m/s -> cells per solver time). Blender's volume motion blur reads this."""
-    v = np.asarray(vel, np.float32)
-    c = v.copy()
+    (m/s -> cells per solver time). Blender's volume motion blur reads this.
+    Overwrites `vel` (float32) and returns it; each sum holds one component twice at most."""
     for a in range(3):
         sl_hi = [slice(None)] * 3
         sl_lo = [slice(None)] * 3
         sl_hi[a], sl_lo[a] = slice(0, -1), slice(1, None)
-        c[tuple(sl_hi) + (a,)] = 0.5 * (v[tuple(sl_hi) + (a,)] + v[tuple(sl_lo) + (a,)])
-    return c / np.float32(vel_scale)
+        hi, lo = tuple(sl_hi) + (a,), tuple(sl_lo) + (a,)
+        vel[hi] += vel[lo]
+        vel[hi] *= 0.5
+    vel /= np.float32(vel_scale)
+    return vel
 
 
 def _space(shape, min_corner, dx):
@@ -70,28 +86,30 @@ def write_vdb(path, density, temperature, velocity, min_corner, dx, clip=1e-6, f
     m/s (`cell_centred_mps`), else as is. Active where
     density or flame is. noise = (density, flame or None, upres): high-res
     grids written as `density`/`flame` instead of the low-res ones.
+    Every grid may be a callable returning the array (see `_read`).
     Returns the active density voxel count."""
-    f32 = lambda a: np.ascontiguousarray(a, np.float32)
-    density, temperature, velocity = f32(density), f32(temperature), f32(velocity)
-    flame = None if flame is None else f32(flame)
-    if vel_scale:
-        velocity = cell_centred_mps(velocity, vel_scale)
+    density = _read(density)
     transform, meta = _space(density.shape, min_corner, dx)
     mask = density > clip
+    flame = None if flame is None else _read(flame)
     if flame is not None:
         mask |= flame > clip
     d_tr, d_meta = transform, meta
     if noise is not None:
-        density, nf, up = noise
-        density = f32(density)
-        flame = None if nf is None else f32(nf)
+        density, flame, up = noise  # the high-res grids; rebinding frees the low-res ones
+        density = _read(density)
         d_tr, d_meta = _space(density.shape, min_corner, dx / up)
-    grids = [_grid(vdb.FloatGrid, "density", density, d_tr, d_meta, clip),
-             _grid(vdb.FloatGrid, "temperature", temperature, transform, meta, clip)]
-    if flame is not None:
-        grids.append(_grid(vdb.FloatGrid, "flame", flame, d_tr, d_meta, clip))
+    d_grid = _grid(vdb.FloatGrid, "density", density, d_tr, d_meta, clip)
+    del density
+    f_grid = None if flame is None else _grid(vdb.FloatGrid, "flame", _read(flame), d_tr, d_meta, clip)
+    del flame
+    t_grid = _grid(vdb.FloatGrid, "temperature", _read(temperature), transform, meta, clip)
+    grids = [d_grid, t_grid] + ([f_grid] if f_grid is not None else [])
     for g in grids:
         g.gridClass = vdb.GridClass.FOG_VOLUME
+    velocity = _owned(velocity)
+    if vel_scale:
+        velocity = cell_centred_mps(velocity, vel_scale)
     grids.append(_grid(vdb.Vec3SGrid, "velocity", velocity, transform, meta, clip, mask=mask))
     grids[-1].gridClass = vdb.GridClass.UNKNOWN if vel_scale else vdb.GridClass.STAGGERED
     vdb.write(path, grids)
@@ -110,10 +128,17 @@ def write_liquid_vdb(path, phi, velocity, min_corner, dx, band=3.0, surface=None
     voxels beyond the band are inactive, inside ones stay active, clamped to
     -band * voxel (pruning them would need a sign flood fill, which the forced
     wall layer breaks where liquid touches a wall). Velocity (simulation grid) is
-    active where phi < 0.5. Returns the active phi voxel count."""
-    phi = np.asarray(phi, np.float32)
-    ls_src, sc = (phi, 1) if surface is None else (surface, int(mesh_scale))
-    ls_src = np.array(ls_src, np.float32)
+    active where phi < 0.5. phi, velocity and surface may be callables (see `_read`).
+    Returns the active phi voxel count."""
+    if surface is None:
+        phi, sc = _owned(phi), 1
+    else:
+        phi, sc = _read(phi), int(mesh_scale)
+    v_shape = phi.shape
+    mask = phi < 0.5
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    ls_src = phi if surface is None else _owned(surface)  # overwritten below
+    del phi
     w = sc if wall_layers is None or surface is None else int(wall_layers)
     ls_src[:w] = ls_src[-w:] = 0.5
     ls_src[:, :w] = ls_src[:, -w:] = 0.5
@@ -121,22 +146,25 @@ def write_liquid_vdb(path, phi, velocity, min_corner, dx, band=3.0, surface=None
     hdx = dx / sc
     transform, meta = _space(ls_src.shape, min_corner, hdx)
     bg = float(band * hdx)
-    ls = np.where(ls_src < band, np.maximum(ls_src, -band) * np.float32(hdx), bg).astype(np.float32)
+    outside = ~(ls_src < band)
+    np.maximum(ls_src, -band, out=ls_src)
+    ls_src *= np.float32(hdx)
+    ls_src[outside] = bg
+    del outside
     g = vdb.FloatGrid(bg)
     g.name = "phi"
     g.transform = transform
     g.saveFloatAsHalf = True
-    g.copyFromArray(ls, ijk=(0, 0, 0), tolerance=0.0)
+    g.copyFromArray(ls_src, ijk=(0, 0, 0), tolerance=0.0)
     g.gridClass = vdb.GridClass.LEVEL_SET
     for k, v in meta.items():
         g[k] = v
-    vt, vmeta = _space(phi.shape, min_corner, dx)
+    del ls_src
+    vt, vmeta = _space(v_shape, min_corner, dx)
+    velocity = _owned(velocity)
     if vel_scale:
         velocity = cell_centred_mps(velocity, vel_scale)
-    mask = phi < 0.5
-    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
-    v = _grid(vdb.Vec3SGrid, "velocity", np.ascontiguousarray(velocity, np.float32), vt,
-              vmeta, 0.0, mask=mask)
+    v = _grid(vdb.Vec3SGrid, "velocity", velocity, vt, vmeta, 0.0, mask=mask)
     v.gridClass = vdb.GridClass.UNKNOWN if vel_scale else vdb.GridClass.STAGGERED
     vdb.write(path, [g, v])
     return g.activeVoxelCount()

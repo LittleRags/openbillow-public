@@ -23,9 +23,9 @@ import numpy as np
 import warp as wp
 
 from .base import Flags, ParticleFlags
-from .warp_liquid import _f4, _mac_interp
+from .warp_common import border, f4, mac_interp
 
-wp.set_module_options({"fuse_fp": False})
+wp.set_module_options({"fuse_fp": False, "enable_backward": False})
 
 FLUID = wp.constant(int(Flags.FLUID))
 NOT_NEIGHBOR = wp.constant(int(Flags.OBSTACLE | Flags.OUTFLOW | Flags.INFLOW))
@@ -167,6 +167,8 @@ def _potentials_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype=
                 vdiff = wp.float32(wp.float64(vdiff) + wp.float64(a) * w)
                 if _dot(nxij, ni) < 0.0:
                     kappa = wp.float32(wp.float64(kappa) + wp.float64(1.0 - _dot(ni, nj)) * w)
+    # 0/0 = NaN when every neighbour is INFLOW, OBSTACLE or OUTFLOW (inside an inflow volume); the NaN
+    # makes those cells foam. Same as Mantaflow, kept on purpose.
     ratio[i, j, k] = float(count_fluid) / float(count_max)
     pot_ta[i, j, k] = _clamp_potential(vdiff, ta_lo, ta_hi)
     if wp.float64(_dot(_normalized(vi), ni)) >= wp.float64(0.6):
@@ -232,7 +234,7 @@ def _emit_cylinder(vel: wp.array4d(dtype=wp.float32), xi: wp.vec3, n: int, radiu
                    r0: int, s0: int, pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
                    life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32)):
     # n particles in a cylinder of the given radius along the local flow; returns the next slot
-    vi = _mac_interp(vel, xi)
+    vi = mac_interp(vel, xi)
     d = dt * vi
     e1 = _normalized(wp.vec3(d[2], 0.0, -d[0]))
     e2 = _normalized(_cross(e1, d))
@@ -335,13 +337,13 @@ def _update_kernel(pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
         dv = dt * v
     elif nr > c_b:
         f = (f | PBUBBLE) & ~(PSPRAY | PFOAM)
-        vg = _mac_interp(vel, p) - v
+        vg = mac_interp(vel, p) - v
         vj = wp.vec3(vg[0] / dt, vg[1] / dt, vg[2] / dt)
         v = v + dt * (k_b * -g + k_d * vj)
         dv = dt * v
     else:
         f = (f | PFOAM) & ~(PBUBBLE | PSPRAY)
-        dv = dt * _mac_interp(vel, p)
+        dv = dt * mac_interp(vel, p)
     if at_mode != 0:
         n = at_steps
         if at_mode == 1:
@@ -387,13 +389,16 @@ class SecondaryMixin:
         radius = int(radius)
         if radius < 1:
             raise ValueError("secondary_potentials: radius must be at least 1")
+        for name, (lo, hi) in (("trapped air", tau_ta), ("wave crest", tau_wc), ("kinetic energy", tau_ke)):
+            if not (hi > lo):  # _clamp_potential divides by hi - lo
+                raise ValueError(f"secondary particles: {name} potential Max ({hi}) must be greater than Min ({lo})")
         dev = self.device
         shape = tuple(phi.shape)
         normal = self._scratch_vec(shape, "snd_normal")
         wp.launch(_gradient_kernel, dim=shape, inputs=[phi, normal], device=dev)
         taus = [float(np.float32(t)) for t in (*tau_ta, *tau_wc, *tau_ke)]
         wp.launch(_potentials_kernel, dim=shape,
-                  inputs=[flags, _f4(vel), normal, radius, wp.float64(1.732 * radius), *taus,
+                  inputs=[flags, f4(vel), normal, radius, wp.float64(1.732 * radius), *taus,
                           float(np.float32(scale_from_manta)), pot_ta, pot_wc, pot_ke,
                           neighbor_ratio], device=dev)
 
@@ -411,15 +416,15 @@ class SecondaryMixin:
         wp.launch(_sample_count_kernel, dim=shape,
                   inputs=[flags, pot_ta, pot_wc, pot_ke, f32(k_ta), f32(k_wc), f32(dt), mode, count, draws],
                   device=dev)
-        wp.utils.array_scan(count.reshape(-1), slot.reshape(-1), inclusive=False)
-        wp.utils.array_scan(draws.reshape(-1), rstart.reshape(-1), inclusive=False)
-        total = int(slot.reshape(-1)[-1:].numpy()[0] + count.reshape(-1)[-1:].numpy()[0])
+        total, n_rnd = self._scan_totals((count.reshape(-1), slot.reshape(-1)),
+                                         (draws.reshape(-1), rstart.reshape(-1)))
+        if total < 0 or n_rnd < 0:  # an int overflow must never reach parts.n
+            raise RuntimeError(f"secondary particle count overflowed (total {total}, random draws {n_rnd})")
         if total == 0:
             return
-        n_rnd = int(rstart.reshape(-1)[-1:].numpy()[0] + draws.reshape(-1)[-1:].numpy()[0])
         self._grow(parts, parts.n + total)
         wp.launch(_sample_emit_kernel, dim=shape,
-                  inputs=[flags, _f4(vel), pot_ta, pot_wc, pot_ke, neighbor_ratio, count, slot, rstart,
+                  inputs=[flags, f4(vel), pot_ta, pot_wc, pot_ke, neighbor_ratio, count, slot, rstart,
                           self._random_stream(n_rnd), parts.n, f32(dt), f32(life_min), f32(life_max),
                           f32(c_s), f32(c_b), f32(k_ta), f32(k_wc), mode, parts.pos, parts.vel, parts.life,
                           parts.flag], device=dev)
@@ -430,7 +435,7 @@ class SecondaryMixin:
         if parts.n:
             f32 = lambda x: float(np.float32(x))  # noqa: E731
             wp.launch(_update_kernel, dim=parts.n,
-                      inputs=[parts.pos, parts.vel, parts.life, parts.flag, _f4(vel), neighbor_ratio,
+                      inputs=[parts.pos, parts.vel, parts.life, parts.flag, f4(vel), neighbor_ratio,
                               flags, wp.vec3(*gravity), f32(k_b), f32(k_d), f32(c_s), f32(c_b), f32(dt),
                               {"OFF": 0, "AUTO": 1, "FIXED": 2}[antitunneling],
                               max(2, int(antitunnel_steps))],

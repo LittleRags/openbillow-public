@@ -23,6 +23,20 @@ import numpy as np
 TYPES = ("FORCE", "WIND", "VORTEX", "MAGNET", "HARMONIC", "CHARGE", "DRAG", "TURBULENCE")
 
 
+def interp_matrix(matrix, frames, frame):
+    """A (4, 4) matrix, or (k, 4, 4) samples at scene times `frames` interpolated linearly at `frame`
+    and held outside the range."""
+    m = np.asarray(matrix, np.float64)
+    if m.ndim == 2:
+        return m
+    if len(m) == 1:
+        return m[0]
+    t = np.asarray(frames, np.float64)
+    i = int(np.clip(np.searchsorted(t, frame) - 1, 0, len(t) - 2))
+    u = min(max((frame - t[i]) / (t[i + 1] - t[i]), 0.0), 1.0)
+    return m[i] + (m[i + 1] - m[i]) * u
+
+
 @dataclass
 class ForceField:
     """One field object, in world space. Names follow Blender's PartDeflect (DNA)."""
@@ -58,15 +72,7 @@ class ForceField:
         """The field with location / z_axis taken from the matrix at scene time `frame`."""
         if self.matrix is None:
             return self
-        m = np.asarray(self.matrix, np.float64)
-        if m.ndim == 3:
-            if len(m) == 1:
-                m = m[0]
-            else:
-                t = np.asarray(self.frames, np.float64)
-                i = int(np.clip(np.searchsorted(t, frame) - 1, 0, len(t) - 2))
-                u = min(max((frame - t[i]) / (t[i + 1] - t[i]), 0.0), 1.0)
-                m = m[i] + (m[i + 1] - m[i]) * u
+        m = interp_matrix(self.matrix, self.frames, frame)
         return replace(self, location=tuple(m[:3, 3]), z_axis=tuple(m[:3, 2]), matrix=None, frames=None)
 
 

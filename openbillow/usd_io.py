@@ -12,6 +12,8 @@ import numpy as np
 
 TYPES = ("spray", "foam", "bubble")
 FPS = 24
+# merge_frames saves after this much new array data: authored samples stay in RAM until a Save
+MERGE_BATCH_BYTES = 512 * 2**20
 
 
 def have_pxr() -> bool:
@@ -56,13 +58,14 @@ def write_frame(path, frame, data, width, fps=FPS):
     st.GetRootLayer().Save()
 
 
-def merge_frames(path, frames, types, width, fps=FPS):
+def merge_frames(path, frames, types, width, fps=FPS, batch_bytes=MERGE_BATCH_BYTES):
     """frames: {frame: per-frame file}. Writes the time-sampled file at `path`; returns its size in bytes."""
     import os
     from pxr import Usd, UsdGeom
     fs = sorted(frames)
     st = _stage(path, fs[0], fs[-1], fps)
     prims = {t: _points(st, t, width) for t in types}
+    unsaved = 0
     for f in fs:
         src = Usd.Stage.Open(frames[f])
         for t in types:
@@ -70,6 +73,10 @@ def merge_frames(path, frames, types, width, fps=FPS):
             pts, vel = p.GetPointsAttr().Get(f), p.GetVelocitiesAttr().Get(f)
             prims[t].GetPointsAttr().Set(pts, f)
             prims[t].GetVelocitiesAttr().Set(vel, f)
+            unsaved += 12 * (len(pts) + len(vel))
+        if unsaved >= batch_bytes:  # the saved samples then live in the file, not in RAM
+            st.GetRootLayer().Save()
+            unsaved = 0
     st.GetRootLayer().Save()
     return os.path.getsize(path)
 

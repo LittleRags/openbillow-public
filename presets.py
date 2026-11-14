@@ -5,7 +5,8 @@ Preferences fetches them from the Pipelineflow server with the support licence k
 each file's sha256 and keeps them in the user extension folder. The server decides who is
 entitled; the add-on enforces nothing.
 
-Preset file (`<name>.json`), format 1 (format 2 when the domain uses the COMBUSTION fire model):
+Preset file (`<name>.json`), format 1 (format 2 when the domain uses the COMBUSTION fire model,
+format 3 when it uses FLAME_FRONT):
     {"format": 1, "name": "Campfire", "description": "...",
      "domain": {<OpenBillowDomain property>: value, "effector_weights": {...}},
      "flow": {<OpenBillowFlow property>: value},   # applied to every Flow object in the scene
@@ -21,10 +22,11 @@ from bpy.types import Operator
 
 from . import ops
 
-FORMAT = 2  # 2: COMBUSTION fire model (0.5.x add-ons would load it as MANTAFLOW, so they refuse it)
+FORMAT = 3  # 2: COMBUSTION fire model; 3: FLAME_FRONT (older add-ons refuse a newer format)
 MATERIALS = "materials.blend"
 INDEX = "index.json"
-SKIP = {"cache_dir", "refresh_vdb", "use_scene_range", "frame_start", "frame_end", "guide_parent", "material"}
+SKIP = {"cache_dir", "refresh_vdb", "use_scene_range", "frame_start", "frame_end", "guide_parent", "material",
+        "domain_type_borders"}
 ROOT_OVERRIDE = None  # tests
 _items = {"key": None, "items": []}  # enum items must stay referenced from Python
 
@@ -41,13 +43,33 @@ def folder(create=False):
         return p
 
 
+_cache = {}  # key -> (time, value); 2 s, so redraws do not hit the disk
+
+
+def clear_cache():
+    _cache.clear()
+
+
+def _cached(key, fn):
+    import time
+    now = time.monotonic()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < 2.0:
+        return hit[1]
+    val = fn()
+    _cache[key] = (now, val)
+    return val
+
+
 def installed():
     """-> local index dict, or None when nothing is downloaded."""
-    try:
-        with open(os.path.join(folder(), INDEX), encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
+    def read():
+        try:
+            with open(os.path.join(folder(), INDEX), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+    return _cached("installed", read)
 
 
 BASE_DIR = os.path.join(os.path.dirname(__file__), "presets_base")  # free base pack, ships in the add-on
@@ -55,10 +77,12 @@ BASE = "base/"  # dropdown id prefix of base presets
 
 
 def base_names():
-    try:
-        return sorted(f for f in os.listdir(BASE_DIR) if f.endswith(".json"))
-    except OSError:
-        return []
+    def read():
+        try:
+            return sorted(f for f in os.listdir(BASE_DIR) if f.endswith(".json"))
+        except OSError:
+            return []
+    return _cached("base", read)
 
 
 def load(name):
@@ -73,10 +97,26 @@ def _settable(group):
             if p.identifier != "rna_type" and p.identifier not in SKIP}
 
 
+FIRST = ("domain_type", "quality")
+# not reset by Apply Preset: the user's own choice (Quality) or deliberately not part of a preset
+KEEP = {"quality", "resolution_max"}
+
+
+def _reset_unlisted(group, listed):
+    """Property defaults for every settable property the preset does not list, so the
+    result does not depend on what the domain was set to before."""
+    for k, p in _settable(group).items():
+        if k not in listed and k not in KEEP and p.type != "POINTER":
+            group.property_unset(k)
+    if "domain_type_borders" in group.bl_rna.properties:  # follows domain_type (props._domain_type_updated)
+        group.property_unset("domain_type_borders")
+
+
 def _assign(group, values):
     """Set the known properties; -> number of keys skipped (unknown or out of range)."""
     props, skipped = _settable(group), 0
-    for k, v in values.items():
+    # keys with update callbacks go first, so a later key cannot be undone by them
+    for k, v in sorted(values.items(), key=lambda kv: kv[0] not in FIRST):
         if k in SKIP:
             continue
         p = props.get(k)
@@ -114,7 +154,8 @@ def capture(context, name, description=""):
     """Preset dict from the active domain and the first Flow object (for authoring the pack)."""
     ob = ops.domain_of(context)
     d = ob.openbillow.domain
-    preset = {"format": 2 if d.fire_model == "COMBUSTION" else 1, "name": name, "description": description,
+    fmt = 3 if d.fire_model == "FLAME_FRONT" else 2 if d.fire_model == "COMBUSTION" else 1
+    preset = {"format": fmt, "name": name, "description": description,
               "domain": _capture(d)}
     flows = ops.scene_objects(context.scene, "FLOW")
     if flows:
@@ -147,7 +188,9 @@ def apply(context, preset):
     ob = ops.domain_of(context)
     if ob is None:
         return 0, "Select a domain"
-    skipped = _assign(ob.openbillow.domain, preset.get("domain", {}))
+    listed = preset.get("domain", {})
+    _reset_unlisted(ob.openbillow.domain, listed)
+    skipped = _assign(ob.openbillow.domain, listed)
     n = 1
     if "flow" in preset:
         for fo in ops.scene_objects(context.scene, "FLOW"):
@@ -235,3 +278,8 @@ def register():
 def unregister():
     for c in reversed(_classes):
         bpy.utils.unregister_class(c)
+
+
+# Stable names for the authoring scripts in OpenBillow-Presets (CODE-ADD-023)
+assign = _assign
+settable = _settable

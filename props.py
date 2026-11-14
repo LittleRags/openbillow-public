@@ -31,14 +31,44 @@ class OpenBillowWeights(PropertyGroup):
                               description="Strength of Turbulence fields (random swirling). 0 switches them off for this fluid.")
 
 
+# Particle Radius default per generator. 1.1447 is a radius of exactly 1 surface-grid cell, the
+# look picked for High Quality in the A/B of CODE-LIQ-004 (2026-11-09); 2.0 is Blender's default.
+RADIUS_HIGH_QUALITY = 1.1447
+RADIUS_OTHER = 2.0
+
+
+def _generator_updated(self, context):
+    """Move the Particle Radius default along with the generator; a value the user chose stays."""
+    aniso = self.mesh_generator == "ANISOTROPIC"
+    old, new = (RADIUS_OTHER, RADIUS_HIGH_QUALITY) if aniso else (RADIUS_HIGH_QUALITY, RADIUS_OTHER)
+    if abs(self.mesh_particle_radius - old) < 1e-4:
+        self.mesh_particle_radius = new
+
+
 def _quality_updated(self, context):
     """Tie the liquid surface builder to Quality; the user can still change it afterwards."""
     self.mesh_generator = "ANISOTROPIC" if self.quality == "HIGH" else "IMPROVED"
 
 
+BORDER_SIDES = ("front", "back", "right", "left", "top", "bottom")
+
+
+def _domain_type_updated(self, context):
+    """Blender's BKE_fluid_domain_type_set: a liquid domain is a closed box, a gas domain is
+    open. Only on a real change, so re-setting the same type (presets) keeps the user's sides."""
+    if self.domain_type == self.domain_type_borders:
+        return
+    self.domain_type_borders = self.domain_type
+    for side in BORDER_SIDES:
+        setattr(self, "use_collision_border_" + side, self.domain_type == "LIQUID")
+
+
 class OpenBillowDomain(PropertyGroup):
     domain_type: EnumProperty(name="Domain Type", default="GAS", items=[
-        ("GAS", "Gas", "Smoke, fire and explosions."), ("LIQUID", "Liquid", "Water, honey and other liquids.")], description="Smoke and fire, or liquid like water and honey.")
+        ("GAS", "Gas", "Smoke, fire and explosions."), ("LIQUID", "Liquid", "Water, honey and other liquids.")], description="Smoke and fire, or liquid like water and honey.",
+        update=_domain_type_updated)
+    # The type the border sides were last set for (internal, see _domain_type_updated).
+    domain_type_borders: StringProperty(default="GAS", options={"HIDDEN"})
     use_apic: EnumProperty(name="Method", default="FLIP", items=[
         ("FLIP", "FLIP", "Lively and splashy, but can look a little noisy."), ("APIC", "APIC", "Smoother, and keeps swirling motion better. Slightly less splashy.")], description="How the liquid is moved around. FLIP is livelier and splashier; APIC is smoother and keeps swirls better.")
     flip_ratio: FloatProperty(name="FLIP Ratio", default=0.97, min=0.0, max=1.0,
@@ -143,14 +173,14 @@ class OpenBillowDomain(PropertyGroup):
                                         description="The longest time a particle lives before it disappears.")
     sndparticle_width: FloatProperty(name="Point Width", default=0.01, min=0.0001, max=1.0, subtype="DISTANCE",
                                      description="Size of each particle point in the exported USD file, in metres.")
-    mesh_generator: EnumProperty(name="Mesh Generator", default="ANISOTROPIC",
+    mesh_generator: EnumProperty(name="Mesh Generator", default="ANISOTROPIC", update=_generator_updated,
                                  items=[("ANISOTROPIC", "High Quality", "Flatter, smoother surfaces, thin splash sheets and fewer blobby drops. Not in Blender."),
                                         ("IMPROVED", "Final", "Smooth surface. Slower, nicer (Blender's Final)."),
                                         ("UNION", "Fast", "Lumpy surface made of overlapping balls. Faster (Blender's Fast).")], description="How the liquid surface is built from the particles.")
     mesh_scale: IntProperty(name="Mesh Upres", default=2, min=1, max=4,
                             description="How much finer the liquid surface is than the simulation. Higher gives smoother detail but uses more memory.")
-    mesh_particle_radius: FloatProperty(name="Particle Radius", default=2.0, min=0.0, max=10.0,
-                                        description="Size of the particles when building the surface, in cells. Bigger smooths out small bumps.")
+    mesh_particle_radius: FloatProperty(name="Particle Radius", default=RADIUS_HIGH_QUALITY, min=0.0, max=10.0,
+                                        description="Size of the particles when building the surface: a value of 1 is a radius of about 0.87 cells of the surface grid (see Mesh Upres). Bigger thickens the surface and smooths out small bumps.")
     mesh_smoothen_pos: IntProperty(name="Smoothing Positive", default=1, min=0, max=100,
                                    description="How many times to smooth bumps that stick out of the surface.")
     mesh_smoothen_neg: IntProperty(name="Smoothing Negative", default=1, min=0, max=100,
@@ -159,6 +189,9 @@ class OpenBillowDomain(PropertyGroup):
                                       description="How strongly sharp inward corners in the surface are rounded off (upper limit).")
     mesh_concave_lower: FloatProperty(name="Concavity Lower", default=0.4, min=0.0, max=10.0,
                                       description="How strongly sharp inward corners in the surface are rounded off (lower limit).")
+    mesh_wall_contact: BoolProperty(name="Wall Contact", default=False,
+                                    description="Let the liquid surface meet walls and obstacles instead of stopping just short "
+                                                "of them, which shows as a seam along glass. Final and High Quality only. Not in Blender.")
     liquid_threshold: FloatProperty(name="Mesh Threshold", default=0.0, soft_min=-0.1, soft_max=0.1,
                                     description="Moves the liquid surface slightly in or out. 0 is the exact surface.")
     liquid_adaptivity: FloatProperty(name="Mesh Adaptivity", default=0.0, min=0.0, max=1.0,
@@ -167,7 +200,7 @@ class OpenBillowDomain(PropertyGroup):
                                 description="How finely the domain is divided along its longest side. Higher gives more detail but needs much more memory and time.")
     use_2d: BoolProperty(name="2D", default=False,
                          description="Simulate a flat slice instead of a 3D volume: faster, good for testing. Gas only, and the domain's Y size is ignored.")
-    time_scale: FloatProperty(name="Speed", default=1.0, min=0.0, soft_max=10.0,
+    time_scale: FloatProperty(name="Speed", default=1.0, min=0.0001, soft_max=10.0,
                               description="Speed of the simulation. Below 1 gives slow motion, above 1 speeds it up.")
     cfl_condition: FloatProperty(name="CFL Number", default=4.0, min=0.0, soft_max=10.0,
                                  description="How far the fluid may move in one step, in cells. Lower is more stable but slower; higher is faster but can go wrong.")
@@ -201,10 +234,23 @@ class OpenBillowDomain(PropertyGroup):
                                "Liquid: the surface snaps to whole cells in the pressure solve."),
         ("HIGH", "High Quality", "Smoke: keeps much more swirl and fine detail at the same resolution; each "
                                  "step takes about 1.7x as long and needs a little more memory. Liquid: "
-                                 "the pressure solve sees the exact surface position (smoother waves)")])
+                                 "the pressure solve sees the exact surface position (smoother waves), and thick "
+                                 "liquids can fold and coil but bake slower")])
     fire_model: EnumProperty(name="Fire Model", default="MANTAFLOW", items=[
         ("MANTAFLOW", "Blender", "Matches Blender's own fire. Soft, blobby flames."),
-        ("COMBUSTION", "Combustion", "Fuel burns only when hot enough, gives off heat, cools down and expands. Gives tongues and sharper flame tips.")])
+        ("COMBUSTION", "Combustion", "Fuel burns only when hot enough, gives off heat, cools down and expands. Gives tongues and sharper flame tips."),
+        ("FLAME_FRONT", "Flame Front (experimental)", "A sheet of fuel burns inward at a fixed speed. 3D only, "
+                        "and does not work with Noise (upres) or Guiding.")])
+    flame_speed: FloatProperty(name="Burn Speed", default=0.5, min=0.1, soft_max=2.0,
+                               description="How fast the flame front eats into the fuel, in m/s. A teepee about 1 m "
+                                           "tall or a 1 m pool fire both look right around 1.0.")
+    use_viscosity: BoolProperty(name="Viscosity", default=False,
+                                description="Air viscosity, stronger in hot gas. Keeps small flames such as candles "
+                                            "smooth and steady; has no visible effect on large fires.")
+    fuel_kelvin: FloatProperty(name="Fuel Temperature", default=600.0, min=400.0, soft_max=900.0, subtype="TEMPERATURE", unit="TEMPERATURE",
+                               description="Temperature in Kelvin of the unburned fuel gas, between Air Temperature and Flame Temperature.")
+    flame_inject: FloatProperty(name="Fuel Inflow", default=0.05, min=0.0, soft_max=0.5,
+                                description="Fuel gas inflow through the emitter outline, in m/s, feeding the burn as the front eats into it.")
     heat_release: FloatProperty(name="Heat Release", default=12.0, min=0.0, soft_max=40.0,
                                 description="How much heat each bit of burning fuel gives off. Higher gives hotter, brighter flames.")
     cooling: FloatProperty(name="Cooling", default=12.0, min=0.0, soft_max=60.0,
@@ -358,11 +404,13 @@ class OpenBillowPreferences(AddonPreferences):
                            description="Which graphics card to use, for example cuda:0. Empty uses the default one.")
     vram_limit_mb: IntProperty(name="VRAM Limit (MB)", default=0, min=0,
                                description="Refuse to start a bake that is estimated to need more graphics memory than this. 0 uses what the card has, minus 1 GB.")
+    auto_update_check: BoolProperty(name="Check for updates at start-up", default=True,
+                                    description="Look for a newer OpenBillow a few seconds after Blender starts, when online access is on. Sends the OpenBillow version, the Blender version and the system type.")
     device_total_mb: IntProperty(default=0, options={"HIDDEN"})
     device_name: StringProperty(default="", options={"HIDDEN"})
 
     support_key: StringProperty(name="Licence Key", subtype="PASSWORD", default="",
-                                description="Your licence key from your purchase (Gumroad), or the OB- key from the claim page.")
+                                description="Your licence key from your purchase.")
     accept_terms: BoolProperty(name="I accept the Licence and Terms of Service", default=False,
                                description="Required to activate your licence key. Read the Licence and the Terms of Service on the OpenBillow website first (buttons above).")
     activated_for: StringProperty(default="", options={"HIDDEN"})  # activation.token() of the activated key + email + computer
@@ -375,6 +423,9 @@ class OpenBillowPreferences(AddonPreferences):
 
     support_attach_errors: BoolProperty(name="Attach recent errors", default=True,
                                         description="Include the last 20 warnings and errors OpenBillow saw. Your home folder name is hidden.")
+
+    support_issue_counts: StringProperty(default="{}", options={"HIDDEN"},
+                                         description="How often each known problem was found since the last support request")
 
     def draw(self, context):
         from .flavor import STORE
@@ -393,8 +444,12 @@ class OpenBillowPreferences(AddonPreferences):
                       else "GPU not detected yet")
         else:
             if not STORE:
-                row.operator("openbillow.install_warp", icon="IMPORT")
+                sub = row.row()
+                sub.enabled = bpy.app.online_access
+                sub.operator("openbillow.install_warp", icon="IMPORT")
             row.label(text="GPU engine (Warp) not installed", icon="ERROR")
+            if not STORE and not bpy.app.online_access:
+                col.label(text="Online access is off (Preferences > System > Network).", icon="ERROR")
         from . import diagnostics
         box = self.layout.box()
         box.label(text="Bug reports", icon="ERROR")

@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})  # the solver never differentiates (CODE-GAS-006)
+
 from .base import Flags
 from .. import forcefields as ff
 

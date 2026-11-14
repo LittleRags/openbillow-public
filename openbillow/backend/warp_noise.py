@@ -11,7 +11,7 @@ import warp as wp
 from .warp_backend import (FLT_MAX, FLUID, FLUID_OR_EMPTY, OBSTACLE, _at_flag, _border,
                            _centered_vel, _sample, _sample_comp)
 
-wp.set_module_options({"fuse_fp": False})
+wp.set_module_options({"fuse_fp": False, "enable_backward": False})
 
 
 @wp.func

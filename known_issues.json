@@ -1,0 +1,152 @@
+{
+  "format": 1,
+  "fields": {
+    "os": {"type": "text", "status": "collected"},
+    "blender_version": {"type": "version", "status": "collected"},
+    "python_version": {"type": "version", "status": "collected"},
+    "openbillow_version": {"type": "version", "status": "collected"},
+    "warp_version": {"type": "version", "status": "collected"},
+    "cuda_available": {"type": "bool", "status": "collected"},
+    "device_init_error": {"type": "text", "status": "collected"},
+    "gpu_name": {"type": "text", "status": "collected"},
+    "compute_capability": {"type": "text", "status": "collected"},
+    "vram_total_mb": {"type": "number", "status": "collected"},
+    "vram_free_mb": {"type": "number", "status": "collected"},
+    "driver_version": {"type": "version", "status": "collected"},
+    "cuda_driver_version": {"type": "version", "status": "collected"},
+    "kernel_cache_exists": {"type": "bool", "status": "collected"},
+    "kernel_cache_mb": {"type": "number", "status": "collected"},
+    "last_jit_error": {"type": "text", "status": "collected"},
+    "recent_errors": {"type": "text_list", "status": "collected"},
+    "log": {"type": "text", "status": "collected"},
+    "warp_installed": {"type": "bool", "status": "planned"},
+    "online_access": {"type": "bool", "status": "planned"},
+    "cache_dir_writable": {"type": "bool", "status": "planned"},
+    "vram_estimate_mb": {"type": "number", "status": "planned"},
+    "last_bake_exit_code": {"type": "number", "status": "planned"}
+  },
+  "issues": [
+    {
+      "id": "warp-not-installed",
+      "symptom": "OpenBillow says the GPU engine (Warp) is not installed",
+      "cause": "The GPU engine is a separate 105 MB download. It needs Blender's online access to be on the first time.",
+      "fix": [
+        "Open Preferences > System > Network and turn on Allow Online Access.",
+        "Open the OpenBillow add-on preferences and press Install GPU Engine."
+      ],
+      "detect": {"any": [
+        {"field": "warp_installed", "op": "eq", "value": false},
+        {"field": "device_init_error", "op": "contains_any", "value": ["no module named 'warp'"]}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "no-nvidia-gpu",
+      "symptom": "OpenBillow does not find a usable GPU",
+      "cause": "This version needs an NVIDIA GPU with CUDA (RTX 2000 series or newer). AMD, Intel and Apple GPUs are not supported.",
+      "fix": [
+        "Run OpenBillow on a computer with a supported NVIDIA GPU.",
+        "On other hardware, use Blender's built-in Mantaflow simulation."
+      ],
+      "detect": {"all": [
+        {"field": "cuda_available", "op": "eq", "value": false},
+        {"field": "warp_version", "op": "not_null"},
+        {"field": "driver_version", "op": "is_null"},
+        {"field": "device_init_error", "op": "is_null"}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "driver-too-old",
+      "symptom": "A bake fails to start with an error about the NVIDIA driver or CUDA version",
+      "cause": "The installed NVIDIA driver is too old for the GPU engine, which needs a driver that supports CUDA 12 or newer.",
+      "fix": [
+        "Install the current driver for your GPU from nvidia.com.",
+        "Restart Blender."
+      ],
+      "detect": {"any": [
+        {"field": "cuda_driver_version", "op": "version_lt", "value": "12.0"},
+        {"field": "device_init_error", "op": "contains_any", "value": ["driver", "cuda version"]}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "online-access-off",
+      "symptom": "The GPU engine download, presets or Send support request are unavailable",
+      "cause": "Blender's Allow Online Access setting is off, so the add-on will not use the network.",
+      "fix": [
+        "Open Preferences > System > Network and turn on Allow Online Access.",
+        "If you need to keep it off, save the diagnostics to a file from the add-on preferences."
+      ],
+      "detect": {"all": [
+        {"field": "online_access", "op": "eq", "value": false}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "cache-folder-not-writable",
+      "symptom": "A bake stops because the cache folder cannot be written",
+      "cause": "The domain's Cache folder does not exist, is read-only, or is on a drive that is full.",
+      "fix": [
+        "Save the .blend file if the Cache folder is a relative path.",
+        "In the domain settings, set Cache to a folder you can write to, on a drive with free space."
+      ],
+      "detect": {"all": [
+        {"field": "cache_dir_writable", "op": "eq", "value": false}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "vram-below-estimate",
+      "symptom": "OpenBillow warns that the simulation will not fit in GPU memory",
+      "cause": "The memory estimate for this domain is larger than the memory on the GPU.",
+      "fix": [
+        "Lower Resolution Divisions on the domain.",
+        "Turn off High Resolution if it is on."
+      ],
+      "detect": {"all": [
+        {"field": "vram_estimate_mb", "op": "gt", "value_field": "vram_total_mb"}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "out-of-vram",
+      "symptom": "A bake stops with an out of memory error",
+      "cause": "The simulation needed more GPU memory than was free.",
+      "fix": [
+        "Close other programs that use the GPU: games, browsers with hardware acceleration, other Blender windows.",
+        "Lower Resolution Divisions on the domain, or turn off High Resolution.",
+        "Set VRAM Limit (MB) in the add-on preferences so that a bake too large for your GPU is refused before it starts."
+      ],
+      "detect": {"any": [
+        {"field": "last_bake_exit_code", "op": "eq", "value": 3},
+        {"field": "log", "op": "contains_any", "value": ["out of memory"]}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "kernel-compile-error",
+      "symptom": "A bake fails with an nvrtc or kernel compile error",
+      "cause": "The saved GPU kernels are often stale or damaged after an update of the GPU engine or the driver.",
+      "fix": [
+        "Close Blender and delete the Warp kernel cache folder. It is rebuilt on the next bake.",
+        "On Linux it is ~/.cache/warp. On Windows it is %LOCALAPPDATA%\\NVIDIA\\warp\\Cache.",
+        "Bake again."
+      ],
+      "detect": {"all": [
+        {"field": "last_jit_error", "op": "contains_any", "value": ["nvrtc", "compile"]}
+      ]},
+      "applies_to": {}
+    },
+    {
+      "id": "first-bake-slow",
+      "symptom": "The first bake takes a long time to start",
+      "cause": "The first bake compiles the GPU kernels, which can take from tens of seconds to a few minutes. Later bakes reuse them.",
+      "fix": [
+        "Wait for the first bake to finish compiling. No action is needed."
+      ],
+      "detect": null,
+      "applies_to": {}
+    }
+  ]
+}

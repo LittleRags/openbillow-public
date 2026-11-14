@@ -35,7 +35,7 @@ Then:
 1. Enable the add-on and open the Physics tab of a mesh object.
 2. First use only: click **Install GPU Engine** in the OpenBillow panel. It downloads
    NVIDIA Warp (about 105 MB) from PyPI into the add-on's folder, and only when you click.
-   Needs internet. On a machine without internet, run
+   Needs internet and Blender's Online Access (Preferences > System > Network). On a machine without internet, run
    `<blender python> -m pip install --target <extension folder>/deps --no-deps warp-lang==1.18.0`
    elsewhere and copy the folder over.
 
@@ -101,7 +101,8 @@ network features and only the base preset pack.
    in the panel. When it finishes, a Volume object `<Domain>_OpenBillow` is added,
    showing the VDB sequence.
    - **Cancel** stops the bake after a few seconds. **Resume** continues from
-     the last checkpoint (greyed out until the process has exited).
+     the last checkpoint (greyed out until the process has exited). On the same
+     machine, a resumed or repeated liquid bake matches an unbroken one exactly.
    - **Free Bake** deletes the baked files and the Volume object.
    - **Refresh VDB on Bake** (under Cache, on by default) makes Blender reload the
      baked files when a bake ends, so baking again over old frames shows the new result.
@@ -126,10 +127,14 @@ network features and only the base preset pack.
    recent Blender errors; home folders are replaced by `~`). Nothing is sent unless
    Blender's online access is on and you press Send. *Save diagnostics to file* is the
    offline option.
+   *Check for Known Problems*, and Send, first compare those diagnostics with a list of known
+   problems on your computer and show the fix if one matches; you can still send. Nothing about
+   you is sent by the check. With online access on, it fetches the current list from
+   openbillow.com; otherwise it uses the copy inside the add-on.
 9. **Updates.** Installed from the OpenBillow repository, Blender updates the add-on. Installed from
    a zip, use Preferences > *Updates* > *Check for Updates* (once per session automatically
-   when online access is on), then *Download* and *Install*; restart Blender afterwards. Only
-   your version and system type are sent.
+   when online access is on; the switch *Check for updates at start-up* turns that off), then *Download* and *Install*; restart Blender afterwards. Only
+   the OpenBillow version, the Blender version and the system type are sent.
 
 Every setting has a plain-language tooltip: hover over it.
 

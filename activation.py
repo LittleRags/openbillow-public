@@ -8,21 +8,17 @@ The identifier is a SHA-256 of the operating system's machine ID (Linux /etc/mac
 MachineGuid, macOS IOPlatformUUID), salted with "openbillow". The raw ID never leaves the
 computer, and nothing else about the computer is sent for activation."""
 import hashlib
-import json
 import os
 import re
 import subprocess
 import sys
 import textwrap
-import threading
-import urllib.error
-import urllib.request
 import uuid
 
 import bpy
 from bpy.types import Operator
 
-from .openbillow import __version__
+from . import net
 from .props import prefs
 
 API = "https://support.pipelineflow.co.uk"
@@ -88,12 +84,21 @@ def machine_id():
     return _cache["id"]
 
 
-def token(p):
-    """What `activated_for` holds when this key and email are activated on this computer."""
-    key, email = p.support_key.strip(), p.support_email.strip().lower()
+def _token(key, email):
+    """Main thread (reads the machine id)."""
+    return _token_for(key, email, machine_id())
+
+
+def _token_for(key, email, mid):
+    key, email = key.strip(), email.strip().lower()
     if not key or not email:
         return ""
-    return hashlib.sha256(f"{key}|{email}|{machine_id()}".encode()).hexdigest()
+    return hashlib.sha256(f"{key}|{email}|{mid}".encode()).hexdigest()
+
+
+def token(p):
+    """What `activated_for` holds when this key and email are activated on this computer."""
+    return _token(p.support_key, p.support_email)
 
 
 def is_activated(p=None):
@@ -102,50 +107,36 @@ def is_activated(p=None):
 
 
 # ---- server calls ----------------------------------------------------------
-def _call(action, key, email):
-    """POST /activate. Runs in a thread; the result is applied by `_poll` on the main thread."""
-    body = {"licence_key": key, "email": email, "machine_id": machine_id()}
-    req = urllib.request.Request(f"{API}/{action}", json.dumps(body).encode(), method="POST", headers={
-        "Content-Type": "application/json", "User-Agent": f"OpenBillow/{__version__}"})
+def _call(action, key, email, mid):
+    """POST /activate. Runs in a thread (net.run); builds the final message here and leaves only the
+    `activated_for` value (in "done": a token, "" to clear, None for no change) to `_apply`."""
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw, ok = r.read(), True
-    except urllib.error.HTTPError as e:
-        raw, ok = e.read(), False
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
-        _result["done"] = (action, False, {"message": f"Could not reach the licence server: {e}"})
-        return
-    try:
-        j = json.loads(raw)
-    except ValueError:
-        j = {}
-    _result["done"] = (action, ok, j)
+        ok, j = net.post_json(f"{API}/{action}", {"licence_key": key, "email": email, "machine_id": mid},
+                              what="the licence server")
+    except net.NetError as e:
+        if str(e).startswith("Unexpected reply"):
+            raise net.NetError("The licence server gave an unexpected reply (are you behind a login page?).") from e
+        raise
+    done = None
+    ok = ok and j.get("activated") is True
+    if ok:
+        done = _token_for(key, email, mid)
+        used = j.get("used")
+        count = f"{used} of {j.get('max', MAX)} activations used in the last 12 months" if isinstance(used, int) \
+            else "activation recorded"
+        msg = f"Activated on this computer ({count})."
+    else:
+        msg = str(j.get("message") or "The licence server gave an unexpected reply.")
+        if j.get("error") in ("key_invalid", "key_revoked", "email_mismatch"):
+            done = ""
+    _result.update(done=done, state="ok" if ok else "error", msg=msg)
 
 
 def _apply():
-    """Main thread: turn the finished call into prefs state and a message."""
-    action, ok, j = _result["done"]
-    _result["done"] = None
-    p = prefs()
-    used = j.get("used")
-    if ok:
-        p.activated_for = token(p)
-        msg = f"Activated on this computer ({used} of {j.get('max', MAX)} activations used in the last 12 months)."
-    else:
-        msg = j.get("message") or "Unexpected reply from the licence server."
-        if j.get("error") in ("key_invalid", "key_revoked", "email_mismatch"):
-            p.activated_for = ""
-    _result.update(state="ok" if ok else "error", msg=msg)
-
-
-def _poll():
-    if _result["done"] is None:
-        return 0.3
-    _apply()
-    for w in bpy.context.window_manager.windows:
-        for a in w.screen.areas:
-            a.tag_redraw()
-    return None
+    """Main thread: copy the finished call's result into the preferences."""
+    done, _result["done"] = _result["done"], None
+    if done is not None:
+        prefs().activated_for = done
 
 
 # ---- operators -------------------------------------------------------------
@@ -164,8 +155,8 @@ def _start(op, action):
         return {"CANCELLED"}
     else:
         _result.update(state="busy", msg="Contacting the licence server...", done=None)
-        threading.Thread(target=_call, args=(action, key, email), daemon=True).start()
-        bpy.app.timers.register(_poll, first_interval=0.3)
+        net.run(_call, _result, action, key, email, machine_id())  # machine_id() on the main thread: it may touch bpy
+        net.wait_redraw(_result, "busy", then=_apply, interval=0.3)
         return {"FINISHED"}
     return {"CANCELLED"}
 

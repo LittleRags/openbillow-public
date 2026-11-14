@@ -14,4 +14,4 @@ __version__ = "0.5.4-early-access"
 _DEPS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deps")
 for _d in (_DEPS, os.environ.get("OPENBILLOW_DEPS", "")):
     if _d and os.path.isdir(_d) and _d not in sys.path:
-        sys.path.insert(0, _d)
+        sys.path.append(_d)  # after the stdlib and Blender's bundled packages: never shadow them

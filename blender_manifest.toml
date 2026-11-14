@@ -19,4 +19,5 @@ copyright = ["2026 Pipelineflow Ltd"]
 
 [permissions]
 files = "Read and write the bake cache folder"
-network = "Warp download, support requests, preset downloads (on click)"
+network = "Update check, Warp download, licence, presets, support"
+clipboard = "Copy diagnostics for bug reports"

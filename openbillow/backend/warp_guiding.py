@@ -25,6 +25,8 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})  # the solver never differentiates (CODE-GAS-006)
+
 from .base import Flags, GuidingStats
 
 OBSTACLE = wp.constant(int(Flags.OBSTACLE))
@@ -142,8 +144,14 @@ def _y_update_kernel(z: wp.array3d(dtype=wp.vec3), z0: wp.array3d(dtype=wp.vec3)
         zv = z[i, j, k]
         d = zv - z0[i, j, k]
         y[i, j, k] = theta * d + zv
-        md = wp.max(md, wp.length_sq(d))
-        mz = wp.max(mz, wp.length_sq(zv))
+        dd = wp.length_sq(d)
+        zz = wp.length_sq(zv)
+        if not wp.isfinite(dd):  # Warp's max is fmax, which skips NaN: report it as inf
+            dd = wp.inf
+        if not wp.isfinite(zz):
+            zz = wp.inf
+        md = wp.max(md, dd)
+        mz = wp.max(mz, zz)
     wp.atomic_max(out, 0, md)
     wp.atomic_max(out, 1, mz)
 
@@ -185,7 +193,7 @@ class GuidingMixin:
     def guiding_solve(self, flags, vel, vel_target, weight, pressure, blur_radius=5,
                       tau=1.0, sigma=0.99, theta=1.0, eps_rel=1e-3, eps_abs=1e-3, max_iters=200,
                       two_d=False, accuracy=1e-3, zero_pressure_fixing=False, divergence=0.0,
-                      fractions=None, phi=None) -> GuidingStats:
+                      fractions=None, phi=None, parallel_coarsening=False) -> GuidingStats:
         sh = vel.shape
         d = self.device
         x, y, z, x0, z0, q, w, inv_a = self._guide_scratch(
@@ -222,12 +230,15 @@ class GuidingMixin:
             stats = self.solve_pressure(flags, z, pressure, accuracy,
                                         zero_pressure_fixing=zero_pressure_fixing,
                                         divergence=divergence, fractions=fractions,
-                                        phi=phi, _phi_gen=phi_gen)
+                                        phi=phi, _phi_gen=phi_gen,
+                                        parallel_coarsening=parallel_coarsening)
             cg_total += stats.iterations
 
             red.zero_()
             wp.launch(_y_update_kernel, dim=sh[:2], inputs=[z, z0, y, float(theta), red], device=d)
             md, mz = np.sqrt(red.numpy())
+            if not (np.isfinite(md) and np.isfinite(mz)):
+                raise RuntimeError("guiding solve diverged")
             if it > 0 and md < eps_dim + eps_rel * mz:
                 break
         wp.copy(vel, z)

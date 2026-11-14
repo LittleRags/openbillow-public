@@ -3,7 +3,7 @@
 import bpy
 from bpy.types import Panel
 
-from . import export, ops, presets
+from . import bakeexit, export, ops, presets
 from .flavor import STORE
 from .props import prefs
 
@@ -60,7 +60,11 @@ class OPENBILLOW_PT_main(Panel):
             else:
                 box.label(text="The GPU engine (Warp) is not installed.", icon="ERROR")
                 if not STORE:
-                    box.operator("openbillow.install_warp", icon="IMPORT")
+                    row = box.row()
+                    row.enabled = bpy.app.online_access
+                    row.operator("openbillow.install_warp", icon="IMPORT")
+                    if not bpy.app.online_access:
+                        box.label(text="Online access is off (Preferences > System > Network).", icon="ERROR")
                 if st["state"] == "error":
                     box.label(text=st["msg"])
             box.label(text="The first bake compiles GPU kernels and takes longer.")
@@ -103,7 +107,8 @@ class OPENBILLOW_PT_domain(_Panel):
         plan = None
         if mode == "AUTO" and limit is not None:  # the limit stands in for free VRAM (no Warp here)
             plan = estimate.device_plan(mb * estimate.MB, limit * estimate.MB, _ram_free(),
-                                        estimate.managed_ok())
+                                        estimate.managed_ok(),
+                                        estimate.host_bytes(size, d.resolution_max, **est))
         row = col.row()
         row.alert = (over and mode == "GPU") or plan == "none"
         mem = "RAM" if mode == "CPU" else "VRAM"
@@ -135,11 +140,18 @@ class OPENBILLOW_PT_domain(_Panel):
         row.operator("openbillow.resume")
         row.operator("openbillow.cancel")
         row.operator("openbillow.free")
+        last = None if running else ops.last_result(folder)
+        if last and bakeexit.failed(last["exit"]) and (
+                st is None or st.get("pid") != last["pid"] or st.get("state") == "running"):
+            r = col.row()
+            r.alert = True
+            r.label(text=f"Bake stopped ({bakeexit.describe(last['exit'])}): {last['tail'][:80]}", icon="ERROR")
+            return
         if st is None:
             return
         state = st.get("state", "?")
         if state == "running" and not running:
-            state = "interrupted"  # bake.lock may still be live if it runs on another machine
+            state = ops.running_elsewhere(folder) or "interrupted"
         f0, f1, f = st.get("frame_start"), st.get("frame_end"), st.get("frame")
         if state == "running" and f0 is not None and f1 and f is not None:
             col.progress(factor=max(0.0, min(1.0, (f - f0 + 1) / (f1 - f0 + 1))),
@@ -260,6 +272,8 @@ class OPENBILLOW_PT_domain_liquid(_Panel):
         if d.mesh_generator == "IMPROVED":
             for p in ("mesh_concave_upper", "mesh_concave_lower"):
                 col.prop(d, p)
+        if d.mesh_generator != "UNION":
+            col.prop(d, "mesh_wall_contact")
 
 
 class OPENBILLOW_PT_domain_secondary(_Panel):
@@ -320,6 +334,13 @@ class OPENBILLOW_PT_domain_fire(_GasPanel):
                 col.prop(d, p)
             col = box.column(heading="Disturbance")
             for p in ("disturbance", "disturbance_size", "disturbance_rate", "shredding"):
+                col.prop(d, p)
+        elif d.fire_model == "FLAME_FRONT":
+            box = lay.box()
+            box.label(text="Flame Front (experimental)", icon="EXPERIMENTAL")
+            col = box.column()
+            for p in ("flame_speed", "fuel_kelvin", "flame_inject", "cooling",
+                      "flame_kelvin", "ambient_kelvin", "use_viscosity"):
                 col.prop(d, p)
 
 

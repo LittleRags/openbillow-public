@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+- Updates and premium preset downloads are now signed: the add-on checks an Ed25519
+  signature from the publisher's offline key and refuses an update or preset index that is
+  unsigned or does not match, with a message saying so. Requires the matching server update.
+
+- High Quality liquid mesh: a thin film of liquid spreading over a floor no longer
+  disappears (it showed as a pool that vanished and left strips along the walls). Splashes
+  and thick liquid look the same; re-bake to see the change.
+
+- New liquid mesh option **Wall Contact** (Final and High Quality generators, off by
+  default): the liquid surface meets walls and obstacles instead of stopping just short of
+  them, which showed as a seam along glass. Existing scenes, bakes and presets are unchanged.
+
+- Liquid domains are now closed boxes, as in Blender: switching Domain Type to Liquid ticks
+  all six Border Collisions (Gas clears them). Before, a liquid domain was open on every
+  side, so liquid drained through the floor and an Inflow never filled a pool. Liquid
+  domains saved with an older version keep their open sides; tick Border Collisions or set
+  the Domain Type again.
+
+- Viscosity in High Quality now uses a solve that converges. Viscous liquids baked in High
+  Quality will look different from earlier versions: thick liquids can fold and coil, and
+  they can bake about 3x slower (measured at strength 1). Classic still matches Blender.
+
+- Flow emit ranges now match the *Start* and *End* frames: a flow no longer starts one substep
+  early or stops one substep early. At one substep per frame a burst now emits one frame later
+  than before, so check the timing of any burst tuned on an earlier version.
+
+- Secondary particles: if the final merge into `particles_snd.usdc` fails, the bake now ends as
+  done with a warning and Resume retries only the merge. The merge no longer needs memory for
+  the whole sequence. New CLI option `--snd-drop-frames` deletes the per-frame files after a
+  successful merge.
+
 ## 0.5.4 Early Access (2026-11-05)
 
 - A small set of base presets now ships inside the add-on, so there is something to start from

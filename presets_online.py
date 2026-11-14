@@ -6,15 +6,11 @@ import os
 import shutil
 import tempfile
 import textwrap
-import threading
-import urllib.error
-import urllib.request
 
 import bpy
 from bpy.types import Operator
 
-from . import activation, presets
-from .openbillow import __version__
+from . import activation, net, presets, signing
 from .presets import FORMAT, INDEX, MATERIALS, folder, installed
 from .props import prefs
 
@@ -24,31 +20,16 @@ _result = {"state": "idle", "msg": ""}  # idle | busy | ok | error
 
 
 # ---- downloading -----------------------------------------------------------
-class ServerError(Exception):
-    pass
+ServerError = net.NetError
 
 
 def _request(path, payload):
-    """POST JSON; -> response bytes. Raises ServerError with the server's message."""
-    req = urllib.request.Request(API + path, json.dumps(payload).encode(), method="POST", headers={
-        "Content-Type": "application/json", "User-Agent": f"OpenBillow/{__version__}"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            n = int(r.headers.get("Content-Length") or 0)
-            if n > MAX_FILE:
-                raise ServerError(f"File too large ({n} bytes)")
-            body = r.read(MAX_FILE + 1)
-            if len(body) > MAX_FILE or n and len(body) != n:
-                raise ServerError("Download incomplete, try again")
-            return body
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read()).get("message")
-        except ValueError:
-            msg = None
-        raise ServerError(msg or f"Server error {e.code}") from None
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
-        raise ServerError(f"Could not reach the preset server: {e}") from None
+    """POST JSON; -> response bytes. Raises NetError with the server's message."""
+    code, body = net.post(API + path, payload, timeout=60, limit=MAX_FILE, what="the preset server")
+    if code >= 400:
+        j = net.as_dict(body) or {}
+        raise ServerError(str(j.get("message") or f"Server error {code}"))
+    return body
 
 
 def _sha(path):
@@ -64,19 +45,45 @@ def _safe(name):
             and os.path.splitext(name)[1] in {".json", ".blend"} and name != INDEX)
 
 
-def download(key, email, machine_id=""):
+def _sha_ok(s):
+    return isinstance(s, str) and len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+
+def _files(index):
+    """The index's entries with a safe name; an entry without a usable sha256 rejects the index."""
+    if not isinstance(index, dict) or not isinstance(index.get("files"), list):
+        raise ServerError("Unexpected reply from the preset server")
+    files = []
+    for f in index["files"]:
+        if not isinstance(f, dict):
+            raise ServerError("Unexpected reply from the preset server")
+        if _safe(f.get("name")):
+            if not _sha_ok(f.get("sha256")):
+                raise ServerError(f"Unexpected reply from the preset server (no checksum for {f['name']})")
+            files.append(f)
+    return files
+
+
+def _signed_index(reply):
+    """The pack's manifest from the signed text of a /presets/index view (CODE-API-004); never the unsigned copy."""
+    if not isinstance(reply, dict):
+        raise ServerError("Unexpected reply from the preset server")
+    try:
+        return signing.signed_json(reply, "preset index")
+    except signing.BadSignature as e:
+        raise ServerError(str(e)) from None
+
+
+def download(key, email, machine_id, root):
     """Fetch the index, then each file whose sha256 differs; drop files no longer listed.
-    Runs in a thread; reports through _result."""
+    Runs in a thread (plain values only, no bpy; `root` is resolved on the main thread); reports through _result."""
     try:
         auth = {"licence_key": key, "email": email, "machine_id": machine_id}
-        try:
-            index = json.loads(_request("/index", auth))
-            files = [f for f in index["files"] if _safe(f["name"])]
-        except (ValueError, KeyError, TypeError):
-            raise ServerError("Unexpected reply from the preset server") from None
-        root = folder(create=True)
-        if not root:
-            raise ServerError("Cannot create the preset folder")
+        index = _signed_index(net.as_dict(_request("/index", auth)))
+        files = _files(index)
+        for name in os.listdir(root):  # leftovers of an interrupted earlier download
+            if name.endswith(".part"):
+                os.remove(os.path.join(root, name))
         got = 0
         for f in files:
             dst = os.path.join(root, f["name"])
@@ -86,9 +93,13 @@ def download(key, email, machine_id=""):
             if hashlib.sha256(body).hexdigest() != f["sha256"]:
                 raise ServerError(f"{f['name']}: checksum mismatch, try again")
             fd, tmp = tempfile.mkstemp(dir=root, suffix=".part")
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(body)
-            os.replace(tmp, dst)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(body)
+                os.replace(tmp, dst)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             got += 1
         keep = {f["name"] for f in files}
         for name in os.listdir(root):
@@ -97,6 +108,7 @@ def download(key, email, machine_id=""):
         with open(os.path.join(root, INDEX), "w", encoding="utf-8") as fh:
             json.dump({"version": index.get("version", "?"), "files": files}, fh, indent=1)
         presets._items["key"] = None
+        presets.clear_cache()
         _result.update(state="ok", msg=f"Presets {index.get('version', '?')}: {len(files)} files, "
                                        f"{got} downloaded" + (", up to date" if not got else ""))
     except ServerError as e:
@@ -110,17 +122,7 @@ def remove():
     if root and os.path.isdir(root):
         shutil.rmtree(root)
     presets._items["key"] = None
-
-
-def _wait_redraw():
-    if _result["state"] == "busy":
-        return 0.5
-    for w in bpy.context.window_manager.windows:
-        for a in w.screen.areas:
-            a.tag_redraw()
-    return None
-
-
+    presets.clear_cache()
 
 
 class OPENBILLOW_OT_presets_download(Operator):
@@ -139,11 +141,13 @@ class OPENBILLOW_OT_presets_download(Operator):
         if not p.support_key.strip() or "@" not in p.support_email:
             self.report({"ERROR"}, "Enter your licence key and email in the Support box")
             return {"CANCELLED"}
+        root = folder(create=True)
+        if not root:
+            self.report({"ERROR"}, "Cannot create the preset folder")
+            return {"CANCELLED"}
         _result.update(state="busy", msg="Downloading presets...")
-        threading.Thread(target=download, args=(p.support_key.strip(), p.support_email.strip(),
-                                                activation.machine_id()),
-                         daemon=True).start()
-        bpy.app.timers.register(_wait_redraw, first_interval=0.5)
+        net.run(download, _result, p.support_key.strip(), p.support_email.strip(), activation.machine_id(), root)
+        net.wait_redraw(_result, "busy")
         return {"FINISHED"}
 
 

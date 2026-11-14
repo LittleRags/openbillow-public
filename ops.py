@@ -7,22 +7,25 @@ import importlib.util
 import json
 import contextlib
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import bpy
+from bpy.props import IntProperty, StringProperty
 from bpy.types import Operator
 
-from . import errlog, export
+from . import bakeexit, errlog, export
 from . import ROOT
-from .props import prefs
+from .openbillow import bakefiles
+from .props import RADIUS_HIGH_QUALITY, RADIUS_OTHER, prefs
 
 POLL_S = 0.5
 CANCEL_KILL_S = 15.0
-_runs = {}  # domain object name -> {"proc", "folder", "cancel_at", "last_vdb"}
+_runs = {}  # normalised bake folder -> {"proc", "folder", "cancel_at", "last_vdb", "uid"}
+_last = {}  # bake folder -> {"exit", "pid", "tail"} of the last finished run
 
 
 # ---- scene helpers ---------------------------------------------------------
@@ -46,14 +49,7 @@ def bake_folder(ob):
     return os.path.normpath(bpy.path.abspath(d))
 
 
-def _moves(ob):
-    """True if the object is animated (transform keyframes, drivers or a parent chain with them)."""
-    while ob is not None:
-        ad = ob.animation_data
-        if ad and (ad.action or ad.drivers):
-            return True
-        ob = ob.parent
-    return False
+_moves = export.may_move
 
 
 def frame_range(scene, ds):
@@ -79,7 +75,30 @@ def scene_fields(scene):
             and export.field_supported(o)]
 
 
-def estimate_args(scene, ob):
+_vol_cache = {}  # object name -> (key, volume)
+
+
+def _flow_volume(o, exact=False):
+    """Volume of a flow mesh; cached on (counts, world matrix) so panel redraws stay cheap.
+    A sculpt that keeps the vertex count is missed (fine for an estimate; bakes pass exact)."""
+    import numpy as np
+    from .openbillow import estimate
+    me = o.data
+    key = (len(me.vertices), len(me.polygons), tuple(round(x, 5) for row in o.matrix_world for x in row))
+    hit = _vol_cache.get(o.name)
+    if hit and hit[0] == key and not exact:
+        return hit[1]
+    v = np.empty(len(me.vertices) * 3, np.float32)
+    me.vertices.foreach_get("co", v)
+    me.calc_loop_triangles()
+    t = np.empty(len(me.loop_triangles) * 3, np.int32)
+    me.loop_triangles.foreach_get("vertices", t)
+    vol = estimate.mesh_volume(v.reshape(-1, 3), t.reshape(-1, 3), o.matrix_world)
+    _vol_cache[o.name] = (key, vol)
+    return vol
+
+
+def estimate_args(scene, ob, exact=False):
     """Keyword extras for estimate.* for domain `ob` and the scene's flows/obstacles."""
     from .openbillow import estimate
     d = ob.openbillow.domain
@@ -88,20 +107,22 @@ def estimate_args(scene, ob):
               force_fields=bool(scene_fields(scene)))
     flows = scene_objects(scene, "FLOW")
     if d.domain_type == "LIQUID":
-        vol = sum(estimate.mesh_volume([tuple(v.co) for v in o.data.vertices],
-                                       [tuple(p.vertices) for p in _tris(o)], o.matrix_world)
-                  for o in flows if o.openbillow.flow.behavior == "GEOMETRY")
+        vol = sum(_flow_volume(o, exact) for o in flows if o.openbillow.flow.behavior == "GEOMETRY")
         dx, dy, dz = domain_size(ob)
         return {**kw, "liquid": True, "apic": d.use_apic == "APIC",
                 "particles_per_cell": estimate.liquid_particles_per_cell(
                     vol / (dx * dy * dz), d.particle_number), "mesh_scale": d.mesh_scale,
                 "secondary": d.use_spray_particles or d.use_foam_particles or d.use_bubble_particles,
                 "particle_scale": d.particle_scale, "viscosity": d.use_viscosity,
-                "diffusion": d.use_diffusion, "fractions": d.use_fractions, "guiding": d.use_guide}
+                "diffusion": d.use_diffusion, "fractions": d.use_fractions, "guiding": d.use_guide,
+                "snd_multiple": d.sndparticle_sampling == "MULTIPLE" and d.quality != "CLASSIC",
+                "aniso_mesh": d.mesh_generator == "ANISOTROPIC",
+                "wall_contact": d.mesh_wall_contact and d.mesh_generator != "UNION"}
     return {**kw, "fire": any(o.openbillow.flow.flow_type != "SMOKE" for o in flows),
             "noise_upres": d.noise_upres if d.use_noise else 0, "dimensions": 2 if d.use_2d else 3,
-            "guiding": d.use_guide, "combustion": d.fire_model == "COMBUSTION",
-            "high_quality": d.quality == "HIGH"}
+            "guiding": d.use_guide, "combustion": d.fire_model in ("COMBUSTION", "FLAME_FRONT"),
+            "flame_front": d.fire_model == "FLAME_FRONT",
+            "gas_viscosity": d.fire_model == "FLAME_FRONT" and d.use_viscosity, "high_quality": d.quality == "HIGH"}
 
 
 def guide_children(scene, ob):
@@ -157,11 +178,18 @@ def _use_deps():
     if os.path.isdir(d) and d not in sys.path:
         sys.path.insert(0, d)
     importlib.invalidate_caches()
+    global _warp_ok
+    _warp_ok = importlib.util.find_spec("warp") is not None
+
+
+_warp_ok = None
 
 
 def warp_available():
-    _use_deps()
-    return importlib.util.find_spec("warp") is not None
+    """Cached; recomputed by _use_deps (register, install finished, Detect GPU). Draw-safe."""
+    if _warp_ok is None:
+        _use_deps()
+    return _warp_ok
 
 
 def _cli(*args):
@@ -201,7 +229,7 @@ def update_volume(ob, folder, status):
             c.objects.link(vo)
         if not liquid:
             vol.materials.append(ob.openbillow.domain.material or
-                             _volume_material(ob.openbillow.domain.fire_model == "COMBUSTION"))
+                             _volume_material(ob.openbillow.domain.fire_model in ("COMBUSTION", "FLAME_FRONT")))
     vol = vo.data
     first = os.path.join(folder, "vdb", "openbillow_%04d.vdb" % f0)
     if bpy.data.filepath:
@@ -386,31 +414,137 @@ def _volume_material(combustion=False):
 
 
 # ---- process + poll --------------------------------------------------------
+def _run_key(folder):
+    return os.path.normcase(os.path.abspath(folder))
+
+
+def _domain_key(ob):
+    """The _runs key for this domain's cache folder, or None if it has no usable folder."""
+    try:
+        return _run_key(bake_folder(ob))
+    except export.ExportError:
+        return None
+
+
+def _run_of(ob):
+    """The live run of this domain, or None. Found by cache folder; failing that by object
+    identity, because renaming a domain moves its default cache folder while the bake carries on
+    in the old one."""
+    r = _runs.get(_domain_key(ob)) or next((x for x in _runs.values() if x["uid"] == ob.session_uid), None)
+    return r if r and r["proc"].poll() is None else None
+
+
 def is_running(ob):
-    r = _runs.get(ob.name)
-    return bool(r and r["proc"].poll() is None)
+    return _run_of(ob) is not None
+
+
+def _run_domain(r):
+    """The domain in the open file that this run belongs to, or None (another file is open).
+    After a file load session_uid has changed, so a domain using the same folder counts."""
+    key, same_folder = _run_key(r["folder"]), None
+    for ob in bpy.data.objects:
+        if ob.openbillow.role != "DOMAIN":
+            continue
+        if ob.session_uid == r["uid"]:
+            return ob
+        if same_folder is None and _domain_key(ob) == key:
+            same_folder = ob
+    return same_folder
+
+
+def _lock_error(folder):
+    """Why this folder must not be touched now, or None."""
+    lock = bakefiles.folder_lock(folder)
+    if not (lock and lock["alive"]):
+        return None
+    if lock["pid"] is None:
+        return "This cache folder's bake.lock is empty or damaged, so a bake may be starting. Try again in a minute."
+    text = f"This cache folder is being baked by pid {lock['pid']} on {lock['host']}. Wait for it, or cancel it there."
+    if not lock["local"]:
+        text += f" If no bake is running on {lock['host']}, delete bake.lock in that folder."
+    return text
+
+
+def running_elsewhere(folder):
+    """Status text if another process holds this folder's lock, else None."""
+    lock = bakefiles.folder_lock(folder)
+    if not (lock and lock["alive"]):
+        return None
+    return f"baking in another process (pid {lock['pid']} on {lock['host']})" if lock["pid"] is not None \
+        else "baking in another process"
+
+
+def last_result(folder):
+    return _last.get(folder)
+
+
+def _sync_scene(r, st, finished):
+    ob = _run_domain(r)
+    if ob is None:
+        return
+    if st:
+        update_volume(ob, r["folder"], st)
+    if finished and ob.openbillow.domain.refresh_vdb:
+        refresh_volume(ob)
 
 
 def _poll():
     now = time.time()
-    for name, r in list(_runs.items()):
-        ob = bpy.data.objects.get(name)
+    for key, r in list(_runs.items()):
         code = r["proc"].poll()
         if code is None and r["cancel_at"] and now - r["cancel_at"] > CANCEL_KILL_S:
-            r["proc"].terminate()
-            r["cancel_at"] = None
+            if r.get("terminated"):  # stuck in native code: SIGTERM is only handled between Python calls
+                r["proc"].kill()
+                r["cancel_at"] = None
+            else:
+                r["proc"].terminate()
+                r["terminated"] = True
+                r["cancel_at"] = now
         st = read_status(r["folder"])
-        if ob and st and (st.get("last_vdb") != r["last_vdb"] or code is not None):
-            r["last_vdb"] = st.get("last_vdb")
-            update_volume(ob, r["folder"], st)
+        if code is not None or (st and st.get("last_vdb") != r["last_vdb"]):
+            r["last_vdb"] = st.get("last_vdb") if st else None
+            try:
+                _sync_scene(r, st, code is not None)
+            except Exception:  # noqa: BLE001 - a scene problem must not end monitoring of the process
+                errlog.record("ERROR", traceback.format_exc())
         if code is not None:
-            if ob and ob.openbillow.domain.refresh_vdb:
-                refresh_volume(ob)
-            r["exit"] = code
-            del _runs[name]
+            res = bakeexit.result(r["folder"], code, r["proc"].pid)
+            _last[r["folder"]] = res
+            if bakeexit.failed(code):
+                errlog.record("BAKE", f"exit {code}: {res['tail']}")
+            del _runs[key]
             _redraw()
     _redraw()
     return POLL_S if _runs else None
+
+
+def wait_for_bakes(timeout_s, cancel_on_timeout=True):
+    """Background-mode helper for scripts: poll until no bake runs. -> True if all finished.
+
+    On timeout the bakes are cancelled (CANCEL file, then terminate after CANCEL_KILL_S, then kill)
+    so no solver is left holding GPU memory; the result is then False.
+    """
+    t0 = time.time()
+    while _runs and time.time() - t0 < timeout_s:
+        _poll()
+        time.sleep(POLL_S)
+    if not _runs:
+        return True
+    if cancel_on_timeout:
+        for r in _runs.values():
+            with contextlib.suppress(OSError):
+                open(os.path.join(r["folder"], "CANCEL"), "w").close()
+            r["cancel_at"] = time.time()  # _poll terminates after CANCEL_KILL_S, then kills after another
+        t1 = time.time()
+        while _runs and time.time() - t1 < 2 * CANCEL_KILL_S + 10:
+            _poll()
+            time.sleep(POLL_S)
+        for r in list(_runs.values()):
+            r["proc"].kill()
+        while _runs:
+            _poll()
+            time.sleep(POLL_S)
+    return False
 
 
 def _redraw():
@@ -422,7 +556,7 @@ def _redraw():
 
 def _start_timer():
     if not bpy.app.timers.is_registered(_poll):
-        bpy.app.timers.register(_poll, first_interval=POLL_S)
+        bpy.app.timers.register(_poll, first_interval=POLL_S, persistent=True)  # survives a file load
 
 
 def _launch(ob, folder, resume):
@@ -435,7 +569,9 @@ def _launch(ob, folder, resume):
     cmd, env = _cli(*args)
     proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
     out.close()
-    _runs[ob.name] = {"proc": proc, "folder": folder, "cancel_at": None, "last_vdb": None}
+    _last.pop(folder, None)
+    _runs[_run_key(folder)] = {"proc": proc, "folder": folder, "cancel_at": None, "last_vdb": None,
+                               "uid": ob.session_uid}
     _start_timer()
 
 
@@ -477,9 +613,11 @@ class _BakeBase(_DomainOp):
         ds = dom.openbillow.domain
         liquid = ds.domain_type == "LIQUID"
         flows, obstacles = scene_objects(sc, "FLOW"), scene_objects(sc, "OBSTACLE")
-        est = estimate_args(sc, dom)
+        est = estimate_args(sc, dom, exact=True)
         try:
             folder = bake_folder(dom)
+            if err := _lock_error(folder):
+                raise export.ExportError(err)
             limit = prefs().limit_mb()
             total = estimate.estimate_total_mb(domain_size(dom), ds.resolution_max, **est)
             if prefs().device_mode == "GPU" and limit is not None and total > limit:
@@ -534,7 +672,9 @@ class OPENBILLOW_OT_cancel(_DomainOp):
         return ob is not None and is_running(ob)
 
     def execute(self, context):
-        r = _runs[context.object.name]
+        r = _run_of(context.object)
+        if r is None:  # ended since the button was drawn
+            return {"CANCELLED"}
         open(os.path.join(r["folder"], "CANCEL"), "w").close()
         r["cancel_at"] = time.time()
         return {"FINISHED"}
@@ -550,8 +690,32 @@ class OPENBILLOW_OT_free(_DomainOp):
         ob = domain_of(context)
         return ob is not None and not is_running(ob)
 
+    shown_folder: StringProperty(options={"HIDDEN", "SKIP_SAVE"})  # for the dialog only
+    shown_files: IntProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    @staticmethod
+    def _refusal(folder):
+        if err := _lock_error(folder):
+            return err
+        if not bakefiles.is_bake_folder(folder):
+            return f"Not an OpenBillow bake folder (no bake.json): {folder}"
+        return None
+
     def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
+        try:
+            folder = bake_folder(context.object)
+        except export.ExportError:
+            return self.execute(context)
+        if self._refusal(folder):
+            return self.execute(context)  # reports why
+        self.shown_folder = folder
+        self.shown_files = len(bakefiles.output_files(folder))
+        return context.window_manager.invoke_props_dialog(self, width=600, title="Free Bake", confirm_text="Delete")
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.label(text=f"Delete {self.shown_files} baked files from this folder?", icon="ERROR")
+        col.label(text=self.shown_folder)
 
     def execute(self, context):
         try:
@@ -559,17 +723,20 @@ class OPENBILLOW_OT_free(_DomainOp):
         except export.ExportError as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
+        if err := self._refusal(folder):
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
         for kind in ("spray", "foam", "bubble"):
             old = bpy.data.objects.get(_snd_name(context.object, kind))
             if old:
                 bpy.data.objects.remove(old)
-        for sub in ("vdb", "state"):
-            shutil.rmtree(os.path.join(folder, sub), ignore_errors=True)
-        for f in ("status.json", "bake.log", "bake.stdout", "CANCEL"):
-            try:
-                os.remove(os.path.join(folder, f))
-            except OSError:
-                pass
+        _last.pop(folder, None)
+        for path in bakefiles.output_files(folder):
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        for sub in bakefiles.OUTPUT_DIRS:
+            with contextlib.suppress(OSError):  # still holds files that are not ours, or never existed
+                os.rmdir(os.path.join(folder, sub))
         vo = bpy.data.objects.get(context.object.name + "_OpenBillow")
         if vo and vo.type == "VOLUME":
             vol = vo.data
@@ -668,6 +835,7 @@ class OPENBILLOW_OT_detect_gpu(Operator):
             self.report({"ERROR"}, "No CUDA device found")
             return {"CANCELLED"}
         p.device_total_mb, p.device_name = devs[0]["total_mb"], devs[0]["name"]
+        _use_deps()
         return {"FINISHED"}
 
 
@@ -686,14 +854,73 @@ _classes = (OPENBILLOW_OT_bake, OPENBILLOW_OT_resume, OPENBILLOW_OT_cancel, OPEN
             OPENBILLOW_OT_detect_gpu, OPENBILLOW_OT_set_role, OPENBILLOW_OT_import_particles)
 
 
+def _volume_behind(ob, st):
+    f0, f1 = st.get("frame_start"), st.get("frame")
+    if not st.get("last_vdb") or f0 is None or f1 is None:
+        return False
+    vo = bpy.data.objects.get(ob.name + "_OpenBillow")
+    return vo is None or (vo.type == "VOLUME" and vo.data.frame_duration < f1 - f0 + 1)
+
+
+RADIUS_STAMP = "mesh_radius_v"  # on a domain: its Particle Radius follows the CODE-LIQ-004 meaning
+
+
+def _migrate_radius(d):
+    """Files saved before CODE-LIQ-004: High Quality ignored the radius and looked like 1.1447,
+    so 2.0 maps to that. Other generators used the old 2.0 default, which is no longer the
+    property's default, so an unset radius has to be written out."""
+    if d.get(RADIUS_STAMP):
+        return
+    d[RADIUS_STAMP] = 1
+    if d.mesh_generator == "ANISOTROPIC":
+        if abs(d.mesh_particle_radius - RADIUS_OTHER) < 1e-4:
+            d.mesh_particle_radius = RADIUS_HIGH_QUALITY
+    elif not d.is_property_set("mesh_particle_radius"):
+        d.mesh_particle_radius = RADIUS_OTHER
+
+
+@bpy.app.handlers.persistent
+def _on_save(*_):
+    """Mark domains as current, so a 2.0 chosen from now on is not mapped at the next load."""
+    for ob in bpy.data.objects:
+        if ob.openbillow.role == "DOMAIN":
+            ob.openbillow.domain[RADIUS_STAMP] = 1
+
+
+@bpy.app.handlers.persistent
+def _on_load(*_):
+    """Catch up with a bake that advanced or finished while another file was open."""
+    for ob in bpy.data.objects:
+        if ob.openbillow.role != "DOMAIN":
+            continue
+        try:
+            _migrate_radius(ob.openbillow.domain)
+            folder = bake_folder(ob)
+            st = read_status(folder)
+            if st and _volume_behind(ob, st):
+                update_volume(ob, folder, st)
+        except export.ExportError:
+            pass
+        except Exception:  # noqa: BLE001 - never disturb a file load
+            errlog.record("ERROR", traceback.format_exc())
+
+
 def register():
     _use_deps()
     for c in _classes:
         bpy.utils.register_class(c)
     errlog.install()
+    bpy.app.handlers.load_post.append(_on_load)
+    bpy.app.handlers.save_pre.append(_on_save)
 
 
 def unregister():
+    if _on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load)
+    if _on_save in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_on_save)
+    if bpy.app.timers.is_registered(_poll):
+        bpy.app.timers.unregister(_poll)
     errlog.uninstall()
     for r in _runs.values():
         r["proc"].terminate()

@@ -23,17 +23,18 @@ import numpy as np
 
 from .backend import Backend, ParticleFlags
 from .backend.base import Vec3
+from . import estimate as _estimate
 from .forcefields import EffectorWeights, ForceField
 from .meshes import cube, uv_sphere
 from .guiding import make_guiding
-from .solver import (DT_DEFAULT, FLT_EPSILON, VECTOR_EPSILON, FrameStats, GuideSettings, MeshGuide, MeshObstacle,
-                     SmokeSolver, _force_scale, rasterize_moving_obstacles, _keyed, _MeshObject, _update_forces)
+from .solver import (FrameStats, Units, _FrameStepper, GuideSettings, MeshGuide, MeshObstacle,
+                     force_scale, rasterize_moving_obstacles, keyed, MeshObject, update_forces)
 
 PHI_MAX = 9999.0
 
 
 @dataclass
-class LiquidFlow(_MeshObject):
+class LiquidFlow(MeshObject):
     """A liquid flow object (Blender flow type Liquid, source Mesh)."""
     behavior: str = "GEOMETRY"          # GEOMETRY (initial liquid), INFLOW or OUTFLOW
     surface_distance: float = 0.0       # cells (Blender's liquid default is 0)
@@ -50,9 +51,9 @@ def BoxLiquid(center: Vec3, size: Vec3, center_end: Vec3 | None = None,
               frame_start: float = 1.0, frame_end: float = 60.0,
               interpolation: str = "BEZIER", samples_per_frame: int = 4, **flow) -> LiquidFlow:
     """Blender's default cube scaled to edge lengths `size` (metres) as a
-    liquid flow, optionally keyframed (see solver._keyed)."""
+    liquid flow, optionally keyframed (see solver.keyed)."""
     verts, tris = cube()
-    m, frames = _keyed(center, tuple(0.5 * a for a in size), center_end, frame_start,
+    m, frames = keyed(center, tuple(0.5 * a for a in size), center_end, frame_start,
                        frame_end, interpolation, samples_per_frame)
     return LiquidFlow(verts, tris, m, frames, **flow)
 
@@ -62,9 +63,13 @@ def SphereLiquid(center: Vec3, radius: float, center_end: Vec3 | None = None,
                  interpolation: str = "BEZIER", samples_per_frame: int = 4, **flow) -> LiquidFlow:
     """Blender's default UV sphere as a liquid flow."""
     verts, tris = uv_sphere()
-    m, frames = _keyed(center, (radius,) * 3, center_end, frame_start, frame_end,
+    m, frames = keyed(center, (radius,) * 3, center_end, frame_start, frame_end,
                        interpolation, samples_per_frame)
     return LiquidFlow(verts, tris, m, frames, **flow)
+
+
+# Mesh generators that honour mesh_wall_contact (Andre, 2026-11-11: Final and High Quality).
+WALL_CONTACT_GENERATORS = ("IMPROVED", "ANISOTROPIC")
 
 
 @dataclass
@@ -119,6 +124,9 @@ class LiquidSettings(GuideSettings):
     # Viscosity panel: implicit solve before the pressure, `viscosity_value` (Strength) used as is.
     use_viscosity: bool = False
     viscosity_value: float = 0.05
+    # Quality HIGH only (Classic always uses Blender's solve): COUPLED converges, MANTAFLOW is
+    # Blender's solve, whose result is set by its iteration cap (CODE-LIQ-014). Not in the add-on.
+    viscosity_solver: str = "COUPLED"
     # Diffusion panel: implicit velocity diffusion before the viscosity. Blender's kinematic
     # viscosity is `viscosity_base * 10^-viscosity_exponent` m^2/s (divided by the domain
     # size squared for the grid).
@@ -142,6 +150,11 @@ class LiquidSettings(GuideSettings):
     mesh_smoothen_neg: int = 1
     mesh_concave_upper: float = 3.5
     mesh_concave_lower: float = 0.4
+    # Wall contact (CODE-LIQ-015, not in Blender; IMPROVED and ANISOTROPIC only): mirror
+    # particles across obstacles and domain walls for the surface only, then clip it half a
+    # mesh cell inside the wall, so the surface meets the glass instead of stopping short.
+    # Off by default: bakes and presets from before it keep their look.
+    mesh_wall_contact: bool = False
     # Secondary particles (Blender's liquid_step_particles, once per frame). Mantaflow simulates
     # all three types when any is on; the use_* flags only choose what is written.
     use_spray_particles: bool = False
@@ -175,6 +188,11 @@ class LiquidSettings(GuideSettings):
     force_fields: list[ForceField] = field(default_factory=list)
     effector_weights: EffectorWeights = field(default_factory=EffectorWeights)
 
+    def validate(self) -> None:
+        """Raise ValueError naming the first bad field."""
+        from .validate import liquid
+        liquid(self)
+
     def estimate_kwargs(self) -> dict:
         """Keyword extras for estimate.*; the fill comes from the initial GEOMETRY flows."""
         from . import estimate
@@ -189,19 +207,36 @@ class LiquidSettings(GuideSettings):
                 "secondary": bool(self.use_spray_particles or self.use_foam_particles
                                   or self.use_bubble_particles),
                 "particle_scale": self.particle_scale, "viscosity": self.use_viscosity,
+                "viscosity_coupled": (self.use_viscosity and self.quality == "HIGH"
+                                      and self.viscosity_solver == "COUPLED"),
                 "diffusion": self.use_diffusion, "fractions": self.use_fractions,
-                "guiding": self.use_guide}
+                "guiding": self.use_guide, "snd_multiple": self.sndparticle_sampling == "MULTIPLE",
+                "aniso_mesh": self.mesh_generator == "ANISOTROPIC",
+                "wall_contact": self.mesh_wall_contact and self.mesh_generator in WALL_CONTACT_GENERATORS,
+                "initial_velocity": any(f.use_initial_velocity and f.behavior != "OUTFLOW" for f in self.flows),
+                "flow_levelsets": self._flow_levelsets()}
+
+    def _flow_levelsets(self) -> int:
+        """Extra level-set grids _init_flows allocates: static inflow, static outflow, moving outflow."""
+        ins = any(f.behavior == "INFLOW" and not (f.animated or f.use_initial_velocity or f.emit_end) for f in self.flows)
+        outs = [f for f in self.flows if f.behavior not in ("GEOMETRY", "INFLOW")]
+        return int(ins) + int(any(not f.animated for f in outs)) + int(any(f.animated for f in outs))
 
 
 @dataclass
 class LiquidFrameStats(FrameStats):
     particles: int = 0
     secondary: int = 0
+    viscosity_iters: list[int] = field(default_factory=list)  # most CG iterations of the 3 components, per substep
+    viscosity_residual: float = 0.0  # largest final sum of squared residuals in the frame
+    viscosity_capped: bool = False   # a solve stopped at the iteration cap without converging
 
 
-class LiquidSolver:
+class LiquidSolver(_FrameStepper):
     NARROW_BAND = 3              # liquid_script.h narrowBandWidth
+    WALL_GHOST_CELLS = 2.0       # mesh_wall_contact: mirror particles this close to a wall
     ANISO_EXTRA_SMOOTHING = 2    # user A/B 2026-11-03: 1 pass breaks the splash crown into flakes
+    ANISO_MIN_HALF = 1.6         # CODE-LIQ-016: shortest half-axis of a sheet-like ellipsoid, mesh cells
     COMBINE_BAND = NARROW_BAND - 1
 
     def __init__(self, backend: Backend, settings: LiquidSettings, frame_start: int = 1):
@@ -214,24 +249,16 @@ class LiquidSolver:
                 raise ValueError(f"liquid: unknown flow behavior {f.behavior!r}")
 
         # Units (as SmokeSolver).
-        self.domain_size = max(s.size)
-        self.dx = self.domain_size / s.resolution_max
-        self.shape = sh = tuple(max(3, int(n / self.dx + 0.5)) for n in s.size)
-        # Blender passes it to Mantaflow as std::to_string (6 decimals): 0.104167 at 24 fps.
-        # The secondary-particle counts int(... * dt) depend on that rounding.
-        self.frame_length = float(f"{DT_DEFAULT * (25.0 / s.fps) * s.time_scale:f}")
-        res_per_m = s.resolution_max / self.domain_size
-        scale_acc = res_per_m * (1.0 / (DT_DEFAULT * 25.0)) ** 2
-        self.gravity = tuple(g * scale_acc for g in s.gravity)
-        self.vel_scale = res_per_m / (25.0 * DT_DEFAULT)   # m/s -> cells per solver time
-        self.dt_min = self.frame_length / max(1, s.timesteps_max)
-        self.dt_max = self.frame_length / max(1, s.timesteps_min)
+        # The secondary-particle counts int(... * dt) depend on the rounded frame length.
+        u = Units.from_settings(s, round_frame_length=True)
+        self.domain_size, self.dx, self.shape, self.frame_length = u.domain_size, u.dx, u.shape, u.frame_length
+        sh = self.shape
+        self.gravity, self.vel_scale = u.gravity, u.vel_scale
+        self.dt_min, self.dt_max = u.dt_min, u.dt_max
         # sigma / rho (m^3/s^2) in cells^3 per solver time^2; the solve takes it times dt.
         self.surface_tension = 0.0
         if s.quality == "HIGH" and s.surface_tension > 0.0:
-            self.surface_tension = s.surface_tension / 1000.0 * res_per_m ** 2 * scale_acc
-            # Capillary limit dt < sqrt(rho_avg dx^3 / (2 pi sigma)), rho_avg = rho / 2 (air).
-            cap = math.sqrt(1.0 / (4.0 * math.pi * self.surface_tension))
+            self.surface_tension, cap = _estimate.capillary_limit(s.surface_tension, u.res_per_m, u.scale_acc)
             self.dt_max, self.dt_min = min(self.dt_max, cap), min(self.dt_min, cap)
 
         # Grids (liquid_alloc). phi starts as initFromFlags on a domain with
@@ -330,7 +357,7 @@ class LiquidSolver:
             b.push_out_of_obstacles(self.snd, self.phi_obs_sp, shift=1.0)
         b.delete_particles_in_obstacle(self.snd, flags)
 
-    def _mesh(self, o: _MeshObject):
+    def _mesh(self, o: MeshObject):
         m = self.b.create_mesh(o.verts, o.tris)
         if not o.animated:
             self.b.set_mesh_transform(m, self.world_to_cell @ o.matrix_at(1.0))
@@ -380,6 +407,8 @@ class LiquidSolver:
         self._moving = [(o, b.create_mesh(o.verts, o.tris)) for o in self.s.obstacles if o.animated]
         static_meshes = [self._mesh(o) for o in static]
         self._collision_meshes = static_meshes + [m for _, m in self._moving]
+        for o, m in list(zip(static, static_meshes)) + self._moving:
+            m.two_sided = m.two_sided or o.plane_init   # "Is Planar": a surface, no inside
         self.phi_obs_in = self.phi_obs_static = self.obvel = None
         if static:
             self.phi_obs_static = b.scalar_grid(sh, PHI_MAX)
@@ -398,6 +427,7 @@ class LiquidSolver:
         if static:
             self.phi_obs_in = self.phi_obs_static
             self._obstacle_levelsets()
+            b.release_scratch("flood", "thin_src")  # not needed again: no moving obstacles
 
     def _obstacle_levelsets(self) -> None:
         """liquid_adaptive_step, after the static join: close and extend
@@ -423,7 +453,7 @@ class LiquidSolver:
 
     @property
     def num_particles(self) -> int:
-        return self.parts.n
+        return self.b.particle_count(self.parts)
 
     def guide_velocity(self) -> np.ndarray:
         """MAC velocity for child domains (guide source DOMAIN), half float.
@@ -469,14 +499,19 @@ class LiquidSolver:
             b.copy(phi, self.phi)
         else:
             b.interpolate_grid(phi, self.phi)
+        wall = s.mesh_wall_contact and s.mesh_generator in WALL_CONTACT_GENERATORS
+        parts = self.parts
+        if wall:  # kernel reach in simulation cells, as the level-set radius
+            reach = 0.5 * math.sqrt(3.0) * (s.mesh_particle_radius + 0.01) / sc
+            parts = b.mirror_particles(self.parts, self.phi_obs, self.WALL_GHOST_CELLS, reach)
         if s.mesh_generator == "ANISOTROPIC":
-            b.anisotropic_particle_levelset(self.parts, pp, self.shape, s.mesh_particle_radius,
+            b.anisotropic_particle_levelset(parts, pp, self.shape, s.mesh_particle_radius,
                                             s.mesh_smoothen_pos + self.ANISO_EXTRA_SMOOTHING,
                                             s.mesh_smoothen_neg,
-                                            scale=float(sc))
+                                            scale=float(sc), min_half=self.ANISO_MIN_HALF)
         elif s.mesh_generator == "IMPROVED":
-            index = b.grid_particle_index(self.parts, phi.shape, scale=float(sc))
-            b.improved_particle_levelset(self.parts, index, pp, s.mesh_particle_radius,
+            index = b.grid_particle_index(parts, phi.shape, scale=float(sc))
+            b.improved_particle_levelset(parts, index, pp, s.mesh_particle_radius,
                                          s.mesh_smoothen_pos, s.mesh_smoothen_neg,
                                          s.mesh_concave_lower, s.mesh_concave_upper,
                                          scale=float(sc))
@@ -488,45 +523,36 @@ class LiquidSolver:
         b.join(phi, pp)
         b.extrapolate_ls_simple(phi, distance=self.NARROW_BAND + 2, inside=True)
         b.extrapolate_ls_simple(phi, distance=3)
+        if wall:
+            b.clip_to_obstacle(phi, self.phi_obs, 0.5 / sc)
         b.set_bound_neumann(phi, 0)
         return b.to_numpy(phi)
 
     # ---- time stepping (as SmokeSolver) ------------------------------------
 
-    _adapt_timestep = SmokeSolver._adapt_timestep
-    _flow_time = SmokeSolver._flow_time
 
-    def step_frame(self) -> LiquidFrameStats:
-        t0 = time.perf_counter()
-        dts, iters, pd_iters = [], [], []
-        t = 0.0
-        if self.guiding:
-            self.guiding.update_frame(self.frame + 1)
-        while t + FLT_EPSILON < self.frame_length:
-            self._adapt_timestep(self.b.max_velocity(self.vel))
-            it, pd = self._substep(self.dt)
-            iters.append(it)
-            if pd is not None:
-                pd_iters.append(pd)
-            dts.append(self.dt)
-            t += self.dt
-            self.time_per_frame += self.dt
-            if self.time_per_frame + VECTOR_EPSILON > self.frame_length:
-                self.time_per_frame = 0.0
-                self.lock_dt = False
+    def _before_frame(self) -> None:
+        self._visc_stats = []
+
+    def _after_frame(self, t0, dts, iters, pd_iters) -> LiquidFrameStats:
+        # With the particles: NaN velocities delete them, leaving a finite but empty phi.
+        self._check_finite(self.phi, self.b.particle_sum(self.parts))
         self.frame += 1
         if self.snd is not None:
             self._step_secondary()
         self.b.synchronize()
         return LiquidFrameStats(self.frame, len(dts), dts, iters, time.perf_counter() - t0,
-                                guide_iters=pd_iters, particles=self.parts.n,
-                                secondary=self.snd.n if self.snd is not None else 0)
+                                guide_iters=pd_iters, particles=self.b.particle_count(self.parts),
+                                secondary=self.b.particle_count(self.snd) if self.snd is not None else 0,
+                                viscosity_iters=[v.iterations for v in self._visc_stats],
+                                viscosity_residual=max((v.residual for v in self._visc_stats), default=0.0),
+                                viscosity_capped=any(v.capped for v in self._visc_stats))
 
     # ---- checkpoints -------------------------------------------------------
 
     def save_state(self) -> dict:
-        """Grids, particles and time state. Not bit-exact on resume: the
-        particle splats use float atomics."""
+        """Grids, particles and time state. A bake resumed from this state
+        is bit-identical to an unbroken one on the same device."""
         b = self.b
         pos, vel, flag = b.get_particles(self.parts)
         st = {"vel": b.to_numpy(self.vel), "phi": b.to_numpy(self.phi), "ppos": pos,
@@ -548,12 +574,12 @@ class LiquidSolver:
                 raise ValueError(f"checkpoint {k} shape {st[k].shape} != grid {self.shape}")
             b.from_numpy(getattr(self, k), np.asarray(st[k], np.float32))
         n = len(st["ppos"])
-        if n > self.parts.capacity:
+        if n > b.particle_capacity(self.parts):
             self.parts = b.particles(int(n * 1.5), apic=self.s.use_apic)
         b.set_particles(self.parts, st["ppos"], st["pvel"], st["pflag"], st.get("paffine"))
         if self.snd is not None and "snd_pos" in st:
             n = len(st["snd_pos"])
-            if n > self.snd.capacity:
+            if n > b.particle_capacity(self.snd):
                 self.snd = b.particles(int(n * 1.5), life=True)
             b.set_particles(self.snd, st["snd_pos"], st["snd_vel"], st["snd_flag"],
                             life=st["snd_life"])
@@ -582,7 +608,7 @@ class LiquidSolver:
             b.fill(self.invel, (0.0, 0.0, 0.0))
         first = self.frame < self.frame_start
         for f, m in (self._geometry if first else []) + self._inflows:
-            if f.behavior == "INFLOW" and f.emit_end and not (f.emit_start - 1 <= t < f.emit_end):
+            if f.behavior == "INFLOW" and f.emit_end and not (f.emit_start - 1 < t <= f.emit_end):
                 continue
             if f.animated:
                 b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(t), dt)
@@ -624,7 +650,7 @@ class LiquidSolver:
         b, s, flags, vel, parts, phi = self.b, self.s, self.flags, self.vel, self.parts, self.phi
 
         t = self._flow_time(dt)
-        forces = _update_forces(self, t)  # moving obstacles: last substep's phi_obs
+        forces = update_forces(self, t)  # moving obstacles: last substep's phi_obs
         self._rasterize_flows(t, dt)
 
         # liquid_adaptive_step. initDomain also resets phiObs to the walls
@@ -717,7 +743,7 @@ class LiquidSolver:
 
         b.add_gravity(flags, vel, tuple(g * dt for g in self.gravity))
         if forces:
-            b.add_force_field(flags, vel, self.forces, _force_scale(self))
+            b.add_force_field(flags, vel, self.forces, force_scale(self))
         into_obs = fr is not None
         b.extrapolate_mac_simple(flags, vel, distance=2, into_obs=into_obs)
         self._wall_bcs()
@@ -727,20 +753,26 @@ class LiquidSolver:
             b.solve_diffusion(flags, vel, kin * dt * float(max(self.shape)) ** 2)
             self._wall_bcs()
         if s.use_viscosity:  # Mantaflow units: dx = 1 / maxres
-            b.apply_viscosity(flags, phi, vel, s.viscosity_value, dt, 1.0 / max(self.shape))
+            if s.viscosity_solver == "COUPLED" and s.quality == "HIGH":  # CODE-LIQ-014
+                self._visc_stats.append(b.apply_viscosity_coupled(flags, phi, vel, s.viscosity_value, dt,
+                                                                  1.0 / max(self.shape)))
+            else:
+                self._visc_stats.append(b.apply_viscosity(flags, phi, vel, s.viscosity_value, dt,
+                                                          1.0 / max(self.shape)))
             self._wall_bcs()
         pd = None
         if self.guiding:  # PD_fluid_guiding: phi (ghost fluid), no obvel
             gst = self.guiding.solve(flags, vel, self.pressure, accuracy=s.cg_accuracy,
                                      zero_pressure_fixing=self.domain_closed, divergence=div,
-                                     fractions=fr, phi=phi)
+                                     fractions=fr, phi=phi, parallel_coarsening=s.quality == "HIGH")
             it, pd = gst.pressure_iterations, gst.iterations
         else:
             it = b.solve_pressure(flags, vel, self.pressure, accuracy=s.cg_accuracy,
                                   zero_pressure_fixing=self.domain_closed, divergence=div,
                                   fractions=fr, obvel=self.obvel if fr is not None else None,
                                   phi=phi if s.quality == "HIGH" else None,
-                                  surface_tension=self.surface_tension * dt).iterations
+                                  surface_tension=self.surface_tension * dt,
+                                  parallel_coarsening=s.quality == "HIGH").iterations
         b.extrapolate_mac_simple(flags, vel, distance=4, into_obs=into_obs)
         self._wall_bcs()
         if fr is None:

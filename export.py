@@ -12,12 +12,11 @@ from __future__ import annotations
 import bpy
 import numpy as np
 
-from .openbillow.bakefile import write_bake
+from .openbillow.bakefile import STATIC_TOL, write_bake
 from .openbillow.forcefields import TYPES as FIELD_TYPES, EffectorWeights, ForceField
 from .openbillow.liquid import LiquidFlow, LiquidSettings
 from .openbillow.solver import DomainSettings, MeshFlow, MeshGuide, MeshObstacle
 
-STATIC_TOL = 1e-7
 # MANTA_main.cpp: a side without border collision is open (outflow).
 _BORDERS = (("use_collision_border_left", "x"), ("use_collision_border_right", "X"),
             ("use_collision_border_front", "y"), ("use_collision_border_back", "Y"),
@@ -49,6 +48,8 @@ def domain_kw(scene, ds) -> dict:
                 heat_release=ds.heat_release, cooling=ds.cooling,
                 cooling_radiative=ds.cooling_radiative, expansion=ds.expansion,
                 flame_kelvin=ds.flame_kelvin, ambient_kelvin=ds.ambient_kelvin,
+                flame_speed=ds.flame_speed, fuel_kelvin=ds.fuel_kelvin, flame_inject=ds.flame_inject,
+                use_viscosity=ds.use_viscosity,
                 disturbance=ds.disturbance, disturbance_size=ds.disturbance_size,
                 disturbance_rate=ds.disturbance_rate, shredding=ds.shredding,
                 use_noise=ds.use_noise, noise_upres=ds.noise_upres,
@@ -163,7 +164,7 @@ def liquid_domain_kw(scene, ds) -> dict:
             **_multiple_rates(ds),
             **{k: getattr(ds, k) for k in ("mesh_generator", "mesh_scale", "mesh_particle_radius",
                                            "mesh_smoothen_pos", "mesh_smoothen_neg",
-                                           "mesh_concave_upper", "mesh_concave_lower")}}
+                                           "mesh_concave_upper", "mesh_concave_lower", "mesh_wall_contact")}}
 
 def liquid_flow_kw(fs) -> dict:
     return dict(behavior=fs.behavior, surface_distance=fs.liquid_surface_distance,
@@ -220,6 +221,22 @@ def _domain_box(ob, depsgraph, flat_y=False):
         raise ExportError(f"Domain '{ob.name}' is flat")
     return tuple(lo.tolist()), tuple((hi - lo).tolist())
 
+def may_move(ob) -> bool:
+    """False only if the object's world matrix certainly cannot change over time.
+    Conservative: anything unusual (animation, drivers, NLA, constraints, rigid body,
+    bone/vertex parents, armature parents) counts as moving."""
+    seen = set()
+    while ob is not None and ob.name_full not in seen:
+        seen.add(ob.name_full)
+        ad = ob.animation_data
+        if (ad and (ad.action or ad.drivers or ad.nla_tracks)) or ob.constraints or ob.rigid_body \
+                or ob.parent_type in {"BONE", "VERTEX", "VERTEX_3"} \
+                or (ob.parent and ob.parent.type == "ARMATURE"):
+            return True
+        ob = ob.parent
+    return False
+
+
 def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: dict,
                 frame_start: int | None = None, frame_end: int | None = None,
                 samples_per_frame: int = 4, liquid: bool = False,
@@ -255,11 +272,23 @@ def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: d
         min_corner, size = _domain_box(domain, dg, domain_settings.get("dimensions") == 2)
         meshes = [_mesh_arrays(ob, dg) for ob, _ in meshed]
         mats = np.empty((len(objs), len(times), 4, 4), np.float64)
-        for j, t in enumerate(times):
-            f = int(np.floor(t))
-            scene.frame_set(f, subframe=float(t - f))
-            for i, ob in enumerate(objs):
-                mats[i, j] = np.array(ob.matrix_world, np.float64)
+        moving = [i for i, ob in enumerate(objs) if may_move(ob)]
+        for i, ob in enumerate(objs):
+            if i not in moving:
+                mats[i] = np.array(ob.matrix_world, np.float64)
+        if moving:
+            wm = bpy.context.window_manager
+            wm.progress_begin(0, len(times))
+            try:
+                for j, t in enumerate(times):
+                    f = int(np.floor(t))
+                    scene.frame_set(f, subframe=float(t - f))
+                    for i in moving:
+                        mats[i, j] = np.array(objs[i].matrix_world, np.float64)
+                    if j % 10 == 0:
+                        wm.progress_update(j)
+            finally:
+                wm.progress_end()
     finally:
         scene.frame_set(old_frame, subframe=old_sub)
 

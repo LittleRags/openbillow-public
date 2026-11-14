@@ -8,22 +8,28 @@ Mantaflow.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import warp as wp
+
+wp.set_module_options({"enable_backward": False})  # the solver never differentiates (CODE-GAS-006)
 
 wp.config.log_level = wp.LOG_WARNING  # no banner or per-module compile lines in solver logs
 
 from .base import (Backend, BackendMemory, FlagGrid, Flags, Grid, MACGrid,
                    PressureStats, ScalarGrid, Shape, Vec3, VectorGrid)
+from .warp_flame import FlameMixin
+from .warp_mixfrac import MixFracMixin
 from .warp_fractions import FractionsMixin
 from .warp_guiding import GuidingMixin
 from .warp_liquid import LiquidMixin
 from .warp_secondary import SecondaryMixin
 from .warp_pressure import MGPressureSolver, _curvature_kernel
-from .warp_diffusion import DiffusionSolver
+from .warp_diffusion import DiffusionSolver, gas_kelvin_kernel
 from .warp_viscosity import ViscositySolver
 from .warp_forcefields import compute_forces_kernel, noise_hash, pack_fields
-from ..estimate import RAM_RESERVE, managed_budget, system_memory  # noqa: F401 - system_memory re-exported
+from ..estimate import RAM_RESERVE, default_limit_mb, managed_budget, system_memory  # noqa: F401 - system_memory re-exported
 from ..noise import _A_COEFFS as WAVELET_A_COEFFS, uv_weight
 
 vec6i = wp.types.vector(length=6, dtype=wp.int32)
@@ -49,7 +55,10 @@ def _max_abs_kernel(a: wp.array3d(dtype=wp.float32), out: wp.array(dtype=wp.floa
     i, j = wp.tid()
     m = float(0.0)
     for k in range(a.shape[2]):
-        m = wp.max(m, wp.abs(a[i, j, k]))
+        x = wp.abs(a[i, j, k])
+        if not wp.isfinite(x):  # Warp's max is fmax, which skips NaN: report it as inf
+            x = wp.inf
+        m = wp.max(m, x)
     wp.atomic_max(out, 0, m)
 
 
@@ -58,7 +67,10 @@ def _max_length_sq_kernel(v: wp.array3d(dtype=wp.vec3), out: wp.array(dtype=wp.f
     i, j = wp.tid()
     m = float(0.0)
     for k in range(v.shape[2]):
-        m = wp.max(m, wp.length_sq(v[i, j, k]))
+        x = wp.length_sq(v[i, j, k])
+        if not wp.isfinite(x):  # see _max_abs_kernel
+            x = wp.inf
+        m = wp.max(m, x)
     wp.atomic_max(out, 0, m)
 
 
@@ -313,6 +325,43 @@ _RAY_DIRS = np.array([
 _RAY_DIRS /= np.linalg.norm(_RAY_DIRS, axis=1, keepdims=True)
 
 
+def list_devices() -> list[dict]:
+    """The CUDA devices, for `openbillow_bake.py devices` (see backend.list_devices)."""
+    wp.init()
+    return [{"name": d.name, "alias": d.alias, "total_mb": d.total_memory // 2**20,
+             "free_mb": d.free_memory // 2**20,
+             "default_limit_mb": default_limit_mb(d.total_memory)}
+            for d in wp.get_cuda_devices()]
+
+
+def diagnostics(device: str = "") -> dict:
+    """Warp and GPU facts for the support button. Never raises: a failure keeps what was found so
+    far and fills device_init_error."""
+    out = {}
+    try:
+        out["warp_version"] = wp.__version__
+        out["warp_path"] = getattr(wp, "__file__", None)
+        wp.init()
+        out["cuda_available"] = bool(wp.is_cuda_available())
+        if out["cuda_available"]:
+            d = wp.get_cuda_device(device) if device else wp.get_cuda_device()
+            out.update(gpu_name=d.name, compute_capability="sm_%d" % d.arch,
+                       vram_total_mb=d.total_memory // 2**20, vram_free_mb=d.free_memory // 2**20)
+            try:
+                v = wp.context.runtime.core.wp_cuda_driver_version()
+                out["cuda_driver_version"] = "%d.%d" % (v // 1000, v % 1000 // 10)
+            except Exception:  # older/newer Warp without this call
+                pass
+        c = wp.config.kernel_cache_dir
+        if c and os.path.isdir(c):
+            out["kernel_cache_exists"] = True
+            out["kernel_cache_mb"] = round(sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(c)
+                                               for f in fs) / 2**20, 1)
+    except Exception as e:
+        out["device_init_error"] = f"{type(e).__name__}: {e}"[:500]
+    return out
+
+
 class WarpMesh:
     """Mesh handle: object-space vertices on the host, cell-space points and
     vertex velocities in a wp.Mesh (BVH) on the device, the last cell-space
@@ -327,8 +376,31 @@ class WarpMesh:
         self.tris = np.ascontiguousarray(tris, dtype=np.int32).reshape(-1, 3)
         self.indices = wp.array(self.tris.ravel(), dtype=wp.int32, device=device)
         self.mesh = wp.Mesh(points=self.points, indices=self.indices, velocities=self.velocities)
-        self.lo = np.floor(self.verts.min(axis=0)).astype(int)
-        self.hi = np.ceil(self.verts.max(axis=0)).astype(int)
+        self.nbytes = self.points.capacity + self.velocities.capacity + self.indices.capacity  # BVH not counted
+        # Closed (watertight, consistently wound) when every directed edge
+        # appears once and its reverse appears once. Unwelded duplicate
+        # vertices make a mesh count as open, the safe side. Open meshes
+        # (a lidless box, a bowl, a single wall) have no inside, so particle
+        # collisions treat them as two-sided surfaces.
+        t = self.tris.astype(np.int64)
+        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
+        nv = max(len(self.verts), 1)
+        fwd, rev = e[:, 0] * nv + e[:, 1], e[:, 1] * nv + e[:, 0]
+        self.closed = bool(len(t)) and len(np.unique(fwd)) == len(fwd) and np.array_equal(
+            np.sort(fwd), np.sort(rev))
+        self.two_sided = not self.closed
+        self._set_bounds(self.verts)
+
+    def _set_bounds(self, p: np.ndarray) -> None:
+        """Bounding box and, for a closed mesh, the orientation (+1 outward
+        winding, -1 inside out: flipped normals or a mirroring transform)."""
+        self.lo = np.floor(p.min(axis=0)).astype(int)
+        self.hi = np.ceil(p.max(axis=0)).astype(int)
+        self.diag = float(np.linalg.norm(p.max(axis=0) - p.min(axis=0)))
+        self.orient = 1.0
+        if self.closed:
+            a, b, c = (p[self.tris[:, i]].astype(np.float64) for i in range(3))
+            self.orient = 1.0 if np.einsum("ij,ij->", a, np.cross(b, c)) >= 0.0 else -1.0
 
     def vertex_normals(self) -> np.ndarray:
         """Blender's vertex normals (corner-angle weighted face normals) of the
@@ -604,15 +676,14 @@ def _wall_levelset_kernel(phi: wp.array3d(dtype=wp.float32), w: int, walls: vec6
 @wp.func
 def _axis(x: float, n: int):
     # One axis of interpol.h BUILD_INDEX: lower sample and upper weight, clamped to the grid.
+    # The range tests come first so NaN and huge values never reach the float-to-int conversion
+    # (undefined on x86: the CPU device read a[INT_MIN] and crashed).
+    if not (x > 0.0):  # negative, zero or NaN
+        return 0, 0.0
+    if x >= float(n - 1):
+        return n - 2, 1.0
     i = int(x)
-    s = x - float(i)
-    if x < 0.0:
-        i = 0
-        s = 0.0
-    if i >= n - 1:
-        i = n - 2
-        s = 1.0
-    return i, s
+    return i, x - float(i)
 
 
 @wp.func
@@ -823,6 +894,30 @@ def _flame_from_heat_kernel(heat: wp.array3d(dtype=wp.float32), flame: wp.array3
     # COMBUSTION flame output: 0 at ignition, 1 at max_temp, linear (no sqrt).
     i, j, k = wp.tid()
     flame[i, j, k] = wp.clamp((heat[i, j, k] - ignition) * inv_range, 0.0, 1.0)
+
+
+@wp.func
+def _gas_rho(h: float, c: float):
+    # Ideal-gas density relative to ambient: T_amb / T, T = T_amb (1 + c max(h, 0)).
+    return 1.0 / (1.0 + c * wp.max(h, 0.0))
+
+
+@wp.kernel
+def _density_weights_kernel(heat: wp.array3d(dtype=wp.float32), w: wp.array3d(dtype=wp.vec3), c: float):
+    # Face weight 1/rho_face, rho_face = (rho_lo + rho_hi) / 2, lower face per axis
+    # (prototype flame2d.py `project_vardens`); index 0 uses the cell's own density.
+    i, j, k = wp.tid()
+    r = _gas_rho(heat[i, j, k], c)
+    rx = r
+    ry = r
+    rz = r
+    if i > 0:
+        rx = _gas_rho(heat[i - 1, j, k], c)
+    if j > 0:
+        ry = _gas_rho(heat[i, j - 1, k], c)
+    if k > 0:
+        rz = _gas_rho(heat[i, j, k - 1], c)
+    w[i, j, k] = wp.vec3(2.0 / (r + rx), 2.0 / (r + ry), 2.0 / (r + rz))
 
 
 @wp.func
@@ -1144,7 +1239,7 @@ def _outflow_vel_kernel(flags: wp.array3d(dtype=wp.int32), new_vel: wp.array3d(d
     vel[i, j, k] = r
 
 
-class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Backend):
+class WarpBackend(GuidingMixin, FlameMixin, MixFracMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Backend):
     name = "warp"
 
     def __init__(self, device: str | None = None, managed: bool = False):
@@ -1161,8 +1256,10 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
         self._tmp = {}  # advection work grids, see _scratch
         self._wl_coeffs = None  # wavelet filter, uploaded on first use
         self._pressure = None  # MGPressureSolver for the current domain shape
+        self._pressure_counted = 0  # bytes of it already in _allocated
         self._diffusion = None  # DiffusionSolver, allocated on first use (48 B/cell)
         self._viscosity = None  # ViscositySolver, allocated on first use (~76 B/cell)
+        self._viscosity_coupled = None  # High Quality solve, CODE-LIQ-014 (+24 B/cell on first use)
         self._ray_dirs = wp.array(_RAY_DIRS, dtype=wp.vec3, device=self.device)
         self._dummy_vec = wp.zeros((1, 1, 1), dtype=wp.vec3, device=self.device)  # unused kernel args
         self._dummy_f = wp.zeros((1, 1, 1), dtype=wp.float32, device=self.device)
@@ -1177,6 +1274,10 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
     @property
     def on_cpu(self) -> bool:
         return not self.device.is_cuda
+
+    @property
+    def memory_mode(self) -> str:
+        return "cpu" if self.on_cpu else ("managed" if self.managed else "gpu")
 
     def memory(self) -> BackendMemory:
         d = self.device
@@ -1259,7 +1360,10 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
         wp.launch(kernel, dim=(grid.shape[0], grid.shape[2]), inputs=[grid], device=self.device)
 
     def to_numpy(self, grid: Grid) -> np.ndarray:
-        return grid.numpy()
+        a = grid.numpy()
+        # On CUDA numpy() is already a fresh download; on the CPU it is a view of the
+        # grid's own memory, which later kernels would change under the caller.
+        return a.copy() if grid.device.is_cpu else a
 
     def from_numpy(self, grid: Grid, array: np.ndarray) -> None:
         expected = grid.shape + ((3,) if grid.dtype == wp.vec3 else ())
@@ -1272,6 +1376,11 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
 
     def sum(self, grid: ScalarGrid) -> float:
         return float(wp.utils.array_sum(grid))
+
+    def particle_sum(self, parts) -> float:
+        if not parts.n:
+            return 0.0
+        return float(sum(sum(wp.utils.array_sum(a[:parts.n])) for a in (parts.pos, parts.vel)))
 
     def _column_max(self, kernel, grid) -> float:
         self._reduce.zero_()
@@ -1304,7 +1413,9 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
     # ---- meshes ------------------------------------------------------------
 
     def create_mesh(self, verts, tris):
-        return WarpMesh(verts, tris, self.device)
+        m = WarpMesh(verts, tris, self.device)
+        self._allocated += m.nbytes
+        return m
 
     def set_mesh_transform(self, mesh, matrix, dt=0.0):
         # Transformed on the host: the bounding box is needed there anyway,
@@ -1318,8 +1429,7 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
             mesh.velocities.zero_()
         mesh.prev = p
         mesh.mesh.refit()
-        mesh.lo = np.floor(p.min(axis=0)).astype(int)
-        mesh.hi = np.ceil(p.max(axis=0)).astype(int)
+        mesh._set_bounds(p)
 
     def _mesh_box(self, mesh, shape):
         """Blender's emission-map box: bbox + ceil(5.196) cells, clamped to
@@ -1431,8 +1541,15 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
         if clamp_mode not in (1, 2):
             raise ValueError(f"advect: clamp_mode must be 1 or 2, got {clamp_mode}")
 
+    # CODE-GAS-015 prototype switch ("BFECC", "MC_CUBIC"; see warp_advect_proto.py). No setting sets it.
+    advect_scheme = "MACCORMACK"
+
     def advect(self, flags, vel, grid, dt, order=2, strength=1.0, clamp_mode=2):
         self._check_advect(grid.shape, order, clamp_mode)
+        if order == 2 and self.advect_scheme != "MACCORMACK":
+            from . import warp_advect_proto as _ap
+            if _ap.advect(self, flags, vel, grid, dt, strength, clamp_mode):
+                return
         fwd, bwd = self._scratch(grid)
         dev = self.device
         sl, mc = ((_wn._sl_vec_kernel, _wn._mc_vec_kernel) if grid.dtype == wp.vec3
@@ -1449,6 +1566,9 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
     def advect_velocity(self, flags, vel, dt, order=2, strength=1.0, clamp_mode=2, field=None):
         self._check_advect(vel.shape, order, clamp_mode)
         field = vel if field is None else field
+        if order == 2 and self.advect_scheme != "MACCORMACK":
+            from . import warp_advect_proto as _ap
+            return _ap.advect_velocity(self, flags, vel, dt, strength, clamp_mode, field)
         fwd, bwd = self._scratch(vel)
         dev = self.device
         wp.launch(_sl_mac_kernel, dim=vel.shape, inputs=[vel, field, fwd, float(dt)], device=dev)
@@ -1520,6 +1640,10 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
                   inputs=[heat, flame, float(ignition_temp), float(1.0 / (max_temp - ignition_temp))],
                   device=self.device)
 
+    def density_face_weights(self, heat, weights, ambient_kelvin, flame_kelvin, flame_max_temp):
+        c = (float(flame_kelvin) - float(ambient_kelvin)) / (float(ambient_kelvin) * float(flame_max_temp))
+        wp.launch(_density_weights_kernel, dim=heat.shape, inputs=[heat, weights, c], device=self.device)
+
     def add_buoyancy(self, flags, vel, grid, strength):
         wp.launch(_buoyancy_kernel, dim=flags.shape,
                   inputs=[flags, grid, vel, wp.vec3(*[float(c) for c in strength])],
@@ -1559,21 +1683,33 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
                        max_iter_factor=1.5,
                        zero_pressure_fixing=False, divergence=0.0, fractions=None,
                        obvel=None, phi=None, _phi_gen=None, divergence_grid=None,
-                       surface_tension=0.0) -> PressureStats:
+                       surface_tension=0.0, parallel_coarsening=False, face_weights=None,
+                       _weights_gen=None) -> PressureStats:
         # max_iter_factor is unused: Mantaflow caps MG-preconditioned CG at 100 iterations.
         # phi may change between calls, so each call rebuilds the matrix unless the
         # caller passes the same _phi_gen (guiding_solve: one build per PD solve).
         if self._pressure is None or self._pressure.shape != tuple(flags.shape):
+            self._allocated -= self._pressure_counted  # the old solver is dropped
             self._pressure = MGPressureSolver(flags.shape, self.device)
+            self._pressure_counted = 0
         if phi is not None and _phi_gen is None:
             self._phi_gen = _phi_gen = getattr(self, "_phi_gen", 0) + 1
+        if face_weights is not None and _weights_gen is None:  # weights change every substep
+            self._weights_gen = _weights_gen = getattr(self, "_weights_gen", 0) + 1
         curv = None
         if phi is not None and surface_tension != 0.0:
             curv = self._scratch(phi)[0]
             wp.launch(_curvature_kernel, dim=phi.shape, inputs=[phi, curv, 1.0], device=self.device)
-        return self._pressure.solve(flags, vel, pressure, float(accuracy), zero_pressure_fixing,
+        stats = self._pressure.solve(flags, vel, pressure, float(accuracy), zero_pressure_fixing,
                                     float(divergence), fractions, obvel, self.fractions_gen,
-                                    phi, _phi_gen or 0, divergence_grid, curv, float(surface_tension))
+                                    phi, _phi_gen or 0, divergence_grid, curv, float(surface_tension),
+                                    parallel_coarsening=parallel_coarsening,
+                                    face_weights=face_weights, weights_gen=_weights_gen or 0)
+        # Some arrays are built on the first solve, so count what exists now (CUDA reads the pool instead).
+        now = self._pressure.nbytes()
+        self._allocated += now - self._pressure_counted
+        self._pressure_counted = now
+        return stats
 
     def apply_viscosity(self, flags, phi, vel, viscosity, dt, dx, accuracy=1e-9,
                         max_iter_factor=1.5) -> PressureStats:
@@ -1583,11 +1719,26 @@ class WarpBackend(GuidingMixin, FractionsMixin, SecondaryMixin, LiquidMixin, Bac
         return self._viscosity.solve(flags, phi, vel, float(viscosity), float(dt), float(dx),
                                      float(accuracy), float(max_iter_factor))
 
-    def solve_diffusion(self, flags, vel, alpha, accuracy=1e-4, max_iter_factor=1.0) -> PressureStats:
+    def apply_viscosity_coupled(self, flags, phi, vel, viscosity, dt, dx) -> PressureStats:
+        from .warp_viscosity_coupled import CoupledViscositySolver
+        if self._viscosity is None or self._viscosity.shape != tuple(flags.shape):
+            self._viscosity = ViscositySolver(flags.shape, self.device)
+            self._allocated += self._viscosity.nbytes()
+        if self._viscosity_coupled is None or self._viscosity_coupled.base is not self._viscosity:
+            self._viscosity_coupled = CoupledViscositySolver(self._viscosity)
+            self._allocated += self._viscosity_coupled.nbytes()
+        return self._viscosity_coupled.solve(flags, phi, vel, float(viscosity), float(dt), float(dx))
+
+    def solve_diffusion(self, flags, vel, alpha, accuracy=1e-4, max_iter_factor=1.0, kelvin=None) -> PressureStats:
         if self._diffusion is None or self._diffusion.shape != tuple(flags.shape):
             self._diffusion = DiffusionSolver(flags.shape, self.device)
             self._allocated += self._diffusion.nbytes()
-        return self._diffusion.solve(flags, vel, float(alpha), float(accuracy), float(max_iter_factor))
+        return self._diffusion.solve(flags, vel, float(alpha), float(accuracy), float(max_iter_factor), kelvin)
+
+    def gas_kelvin(self, heat, kelvin, ambient_kelvin, flame_kelvin, flame_max_temp):
+        k = (float(flame_kelvin) - float(ambient_kelvin)) / float(flame_max_temp)
+        wp.launch(gas_kelvin_kernel, dim=heat.shape, inputs=[heat, kelvin, float(ambient_kelvin), k],
+                  device=self.device)
 
     # ---- noise / upres -----------------------------------------------------
 

@@ -23,7 +23,14 @@ from .forcefields import EffectorWeights, ForceField
 from .liquid import LiquidFlow, LiquidSettings
 from .solver import DomainSettings, MeshFlow, MeshGuide, MeshObstacle
 
-SCHEMA = 16  # 2: fire settings (domain fire fields, flow_type, fuel_amount); 3: flow emit_start/emit_end;
+SCHEMA = 21  # 21: fire_model DIFFUSION (diffusion_hrrpua, diffusion_heat_of_combustion, diffusion_air_fuel_ratio,
+# diffusion_radiative_fraction, diffusion_soot_yield; older bakes read the defaults, unused by their fire models);
+# 20: FLAME_FRONT use_viscosity (older bakes read as off, their look unchanged);
+# 19: fire_model FLAME_FRONT (flame_speed, fuel_kelvin, flame_inject, flame_glow_cells,
+# flame_source_gap, flame_smoke_yield; older bakes read the defaults, unused by their fire models);
+# 18: mesh_wall_contact (older bakes read as off, their look unchanged);
+# 17: High Quality mesh honours mesh_particle_radius (older 2.0 reads as 1.1447);
+# 2: fire settings (domain fire fields, flow_type, fuel_amount); 3: flow emit_start/emit_end;
 # 4: noise settings (use_noise, noise_upres, noise_strength, noise_pos_scale, noise_time_anim);
 # 5: domain_type and liquid domains (LiquidSettings, LiquidFlow fields);
 # 6: force_fields, effector_weights, render_fps; 7: domain_mat3; 8: Turbulence fields (use_global_coords);
@@ -56,12 +63,13 @@ _TYPES = {
 
 def _value(a, v):
     return list(v) if a in _TUPLE_FIELDS else v
-# Left out of the hash: changing the end frame keeps a bake resumable.
-_HASH_SKIP = ("frame_start", "frame_end", "openbillow_version")
 
 
-def _keys(names: list[str]) -> list[str]:
-    return [f"o{i}" for i in range(len(names))]
+# Left out of the hash: changing the end frame keeps a bake resumable. The start frame is hashed
+# (CODE-SOL-012); checkpoints from 0.5.3 and earlier left it out, so the legacy hash keeps that list.
+_HASH_SKIP = ("frame_end", "openbillow_version")
+_LEGACY_HASH_SKIP = ("frame_start",) + _HASH_SKIP
+STATIC_TOL = 1e-7  # transform samples closer than this count as an object that does not move
 
 
 def _pack(arrays: dict, key: str, o) -> None:
@@ -142,6 +150,11 @@ def read_bake(folder: str) -> tuple[DomainSettings | LiquidSettings, int, int]:
     cls, dom_fields, flow_cls, flow_fields = _TYPES[dtype]
     dom = {a: (tuple(v) if a in _TUPLE_FIELDS else v)
            for a, v in doc.get("domain", {}).items() if a in dom_fields}
+    if doc.get("schema", 0) < 20:
+        dom["use_viscosity"] = False  # before 20 FLAME_FRONT had no viscosity
+    if (doc.get("schema", 0) < 17 and dom.get("mesh_generator") == "ANISOTROPIC"
+            and abs(dom.get("mesh_particle_radius", 2.0) - 2.0) < 1e-4):
+        dom["mesh_particle_radius"] = 1.1447  # before 17 High Quality ignored it and looked like this
     with np.load(os.path.join(folder, "objects.npz")) as npz:
         flows = [_unpack(npz, e, flow_cls, flow_fields) for e in doc.get("flows", [])]
         obstacles = [_unpack(npz, e, MeshObstacle, _OBS_FIELDS) for e in doc.get("obstacles", [])]
@@ -154,19 +167,70 @@ def read_bake(folder: str) -> tuple[DomainSettings | LiquidSettings, int, int]:
                                      frames=npz[f"{k}_times"] if f"{k}_times" in npz.files else None))
     w = doc.get("effector_weights", {})
     weights = EffectorWeights(float(w.get("all", 1.0)), dict(w.get("types", {})))
-    return (cls(**dom, flows=flows, obstacles=obstacles, guides=guides, force_fields=fields,
-                effector_weights=weights),
-            int(doc["frame_start"]), int(doc["frame_end"]))
+    settings = cls(**dom, flows=flows, obstacles=obstacles, guides=guides, force_fields=fields,
+                   effector_weights=weights)
+    settings.validate()
+    return settings, int(doc["frame_start"]), int(doc["frame_end"])
 
 
-def settings_hash(folder: str) -> str:
-    """sha256 of bake.json without frame_start/frame_end/openbillow_version, plus
-    objects.npz bytes."""
+def _doc_hash(folder: str, skip=_HASH_SKIP):
+    """sha256 object over bake.json without the keys in `skip`."""
     with open(os.path.join(folder, "bake.json")) as fh:
         doc = json.load(fh)
-    for k in _HASH_SKIP:
+    for k in skip:
         doc.pop(k, None)
-    h = hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode())
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _update(h, key: str, a: np.ndarray) -> None:
+    h.update(f"{key}|{a.dtype}|{a.shape}|".encode())
+    h.update(a.tobytes())
+
+
+class SettingsHasher:
+    """Settings hash of a bake folder, optionally limited to what the frames up to
+    `upto_frame` could read. Frame F only reads transform samples with time <= F, so
+    a later end frame (which appends samples) leaves that digest unchanged. Loads
+    objects.npz once: a bake takes one digest per checkpoint."""
+
+    def __init__(self, folder: str):
+        self._base = _doc_hash(folder)
+        self._matrices = []  # (key, matrix, times or None), times only when sampled
+        with np.load(os.path.join(folder, "objects.npz")) as z:
+            for k in sorted(z.files):
+                if k.endswith("_times"):
+                    continue
+                a = z[k]
+                if not k.endswith("_matrix"):
+                    _update(self._base, k, a)
+                    continue
+                tk = k[:-len("matrix")] + "times"
+                self._matrices.append((k, a, z[tk] if a.ndim == 3 and tk in z.files else None))
+
+    def digest(self, upto_frame: int | None = None) -> str:
+        h = self._base.copy()
+        for k, a, t in self._matrices:
+            if t is not None:
+                if upto_frame is not None:
+                    n = int(np.searchsorted(t, upto_frame, side="right"))
+                    a, t = a[:n], t[:n]
+                if len(a) and np.ptp(a, axis=0).max() < STATIC_TOL:
+                    a = a[0]  # the form the exporter writes for an object that does not move
+                else:
+                    h.update(t.tobytes())
+            _update(h, k, a)
+        return h.hexdigest()
+
+
+def settings_hash(folder: str, upto_frame: int | None = None) -> str:
+    """sha256 of bake.json without frame_start/frame_end/openbillow_version, plus the
+    objects.npz arrays. See SettingsHasher for `upto_frame`."""
+    return SettingsHasher(folder).digest(upto_frame)
+
+
+def _legacy_hash(folder: str) -> str:
+    """The hash stored in checkpoints written by 0.5.3 and earlier (raw objects.npz bytes)."""
+    h = _doc_hash(folder, _LEGACY_HASH_SKIP)
     with open(os.path.join(folder, "objects.npz"), "rb") as fh:
         h.update(fh.read())
     return h.hexdigest()

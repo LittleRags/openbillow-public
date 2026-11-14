@@ -21,17 +21,24 @@ Differences from Mantaflow, none of which change the converged answer:
 - The matrix and multigrid hierarchy are cached and rebuilt only when the
   FLUID/OBSTACLE/EMPTY layout of the flags (or the pinning) changes. PcMGStatic
   never rebuilds, so the two agree for static obstacles.
-- The coarsest level is solved with a precomputed dense pseudo-inverse instead
+- The coarsest level is solved with a precomputed dense inverse (pseudo-inverse when singular) instead
   of Jacobi-CG to 1e-4 * accuracy (the same answer to within that tolerance).
 - Coarse-vertex selection (GridMg::genCoarseGrid, a serial greedy pass) runs as
   a one-thread Warp CPU kernel; everything per iteration runs on the GPU.
+  High Quality uses a parallel rule on the GPU instead (`parallel_coarsening`):
+  a different preconditioner, so other iteration counts, same converged answer.
 """
 from __future__ import annotations
+
+import time
 
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})  # the solver never differentiates (CODE-GAS-006)
+
 from .base import Flags, PressureStats
+from .warp_common import BLOCK, border, unravel
 
 FLUID = wp.constant(int(Flags.FLUID))
 EMPTY = wp.constant(int(Flags.EMPTY))
@@ -42,8 +49,6 @@ LAYOUT = wp.constant(int(Flags.FLUID | Flags.OBSTACLE | Flags.EMPTY))  # bits th
 TRIVIAL_SCALE = wp.constant(1e-6)  # GridMg::mTrivialEquationScale
 MG_MAX_ITER = 100                  # solvePressureSystem: maxIter with PcMGStatic/PcMGDynamic
 GF_CLAMP = wp.constant(1e-4)        # solvePressure gfClamp
-BLOCK = 256                        # block size of the tile-reduction kernels
-MAX_COARSEST = 4096                # active vertices allowed on the coarsest level (dense solve)
 
 # Vertex types. Level 0: inactive / active / active trivial equation (GridMg::VertexType).
 # The greedy coarsening also uses removed / zero / free, as in genCoarseGrid.
@@ -57,16 +62,6 @@ HEAP_K = wp.constant(9)  # NKMinHeap buckets: at most 8 free interpolation verti
 
 
 # ---- small helpers ------------------------------------------------------------
-
-@wp.func
-def _border(i: int, j: int, k: int, nx: int, ny: int, nz: int):
-    return i < 1 or j < 1 or k < 1 or i > nx - 2 or j > ny - 2 or k > nz - 2
-
-
-@wp.func
-def _unravel(t: int, ny: int, nz: int):
-    return wp.vec3i(t // (ny * nz), (t // nz) % ny, t % nz)
-
 
 @wp.func
 def _odd_weight(p: wp.vec3i):
@@ -178,7 +173,7 @@ def _ghost_diag_kernel(flags: wp.array3d(dtype=wp.int32), phi: wp.array3d(dtype=
     """ApplyGhostFluidDiagonal (bnd 1)."""
     i, j, k = wp.tid()
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
-    if _border(i, j, k, nx, ny, nz) or (flags[i, j, k] & FLUID) == 0:
+    if border(i, j, k, nx, ny, nz) or (flags[i, j, k] & FLUID) == 0:
         return
     ph = phi[i, j, k]
     d = a0[i, j, k]
@@ -211,7 +206,7 @@ def _curvature_kernel(phi: wp.array3d(dtype=wp.float32), curv: wp.array3d(dtype=
     for a sphere) of phi, clamped to +-clamp. Outer layer 0."""
     i, j, k = wp.tid()
     nx, ny, nz = phi.shape[0], phi.shape[1], phi.shape[2]
-    if _border(i, j, k, nx, ny, nz):
+    if border(i, j, k, nx, ny, nz):
         curv[i, j, k] = 0.0
         return
     c = phi[i, j, k]
@@ -242,7 +237,7 @@ def _replace_clamped_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(d
     FLUID neighbours' faces only, so it is race-free in place."""
     i, j, k = wp.tid()
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
-    if _border(i, j, k, nx, ny, nz) or (flags[i, j, k] & EMPTY) == 0:
+    if border(i, j, k, nx, ny, nz) or (flags[i, j, k] & EMPTY) == 0:
         return
     ph = phi[i, j, k]
     v = vel[i, j, k]
@@ -265,46 +260,63 @@ def _replace_clamped_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(d
 def _laplace_kernel(flags: wp.array3d(dtype=wp.int32), a0: wp.array3d(dtype=wp.float32),
                     ai: wp.array3d(dtype=wp.float32), aj: wp.array3d(dtype=wp.float32),
                     ak: wp.array3d(dtype=wp.float32), frac: wp.array3d(dtype=wp.vec3),
-                    use_frac: int):
+                    use_frac: int, wts: wp.array3d(dtype=wp.vec3), use_w: int):
     """MakeLaplaceMatrix (bnd 1). With fractions: diagonal = sum of the six face
-    fractions, off-diagonal = -fraction to FLUID neighbours. Fills zeros everywhere else."""
+    fractions, off-diagonal = -fraction to FLUID neighbours. Fills zeros everywhere else.
+    use_w (not in Mantaflow): each face coefficient is also times its face weight
+    wts (1/rho at the face, lower face per axis), i.e. the matrix of div(w grad p)."""
     i, j, k = wp.tid()
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
     d = float(0.0)
     x = float(0.0)
     y = float(0.0)
     z = float(0.0)
-    if use_frac != 0 and not _border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
+    if border(i, j, k, nx, ny, nz) or (flags[i, j, k] & FLUID) == 0:
+        a0[i, j, k] = d
+        ai[i, j, k] = x
+        aj[i, j, k] = y
+        ak[i, j, k] = z
+        return
+    wl = wp.vec3(1.0, 1.0, 1.0)
+    wx = float(1.0)
+    wy = float(1.0)
+    wz = float(1.0)
+    if use_w != 0:
+        wl = wts[i, j, k]
+        wx = wts[i + 1, j, k][0]
+        wy = wts[i, j + 1, k][1]
+        wz = wts[i, j, k + 1][2]
+    if use_frac != 0:
         f = frac[i, j, k]
-        fx = frac[i + 1, j, k][0]
-        fy = frac[i, j + 1, k][1]
-        fz = frac[i, j, k + 1][2]
-        d = f[0] + fx + f[1] + fy + f[2] + fz
+        fx = frac[i + 1, j, k][0] * wx
+        fy = frac[i, j + 1, k][1] * wy
+        fz = frac[i, j, k + 1][2] * wz
+        d = f[0] * wl[0] + fx + f[1] * wl[1] + fy + f[2] * wl[2] + fz
         if (flags[i + 1, j, k] & FLUID) != 0:
             x = -fx
         if (flags[i, j + 1, k] & FLUID) != 0:
             y = -fy
         if (flags[i, j, k + 1] & FLUID) != 0:
             z = -fz
-    elif not _border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
+    else:
         if (flags[i - 1, j, k] & OBSTACLE) == 0:
-            d += 1.0
+            d += wl[0]
         if (flags[i + 1, j, k] & OBSTACLE) == 0:
-            d += 1.0
+            d += wx
         if (flags[i, j - 1, k] & OBSTACLE) == 0:
-            d += 1.0
+            d += wl[1]
         if (flags[i, j + 1, k] & OBSTACLE) == 0:
-            d += 1.0
+            d += wy
         if (flags[i, j, k - 1] & OBSTACLE) == 0:
-            d += 1.0
+            d += wl[2]
         if (flags[i, j, k + 1] & OBSTACLE) == 0:
-            d += 1.0
+            d += wz
         if (flags[i + 1, j, k] & FLUID) != 0:
-            x = -1.0
+            x = -wx
         if (flags[i, j + 1, k] & FLUID) != 0:
-            y = -1.0
+            y = -wy
         if (flags[i, j, k + 1] & FLUID) != 0:
-            z = -1.0
+            z = -wz
     a0[i, j, k] = d
     ai[i, j, k] = x
     aj[i, j, k] = y
@@ -348,6 +360,14 @@ def _types0_kernel(a0: wp.array3d(dtype=wp.float32), ai: wp.array3d(dtype=wp.flo
 
 
 @wp.kernel
+def _types_changed_kernel(t: wp.array3d(dtype=wp.int32), old: wp.array3d(dtype=wp.int32),
+                          changed: wp.array(dtype=wp.int32)):
+    i, j, k = wp.tid()
+    if t[i, j, k] != old[i, j, k]:
+        changed[0] = 1
+
+
+@wp.kernel
 def _layout_kernel(flags: wp.array3d(dtype=wp.int32), snap: wp.array3d(dtype=wp.uint8),
                    write: int, changed: wp.array(dtype=wp.int32)):
     """Compare (or store) the flag bits the matrix depends on."""
@@ -376,7 +396,7 @@ def _rhs_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype=wp.vec3
     i, j, k = wp.tid()
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
     s = float(0.0)
-    if use_frac != 0 and not _border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
+    if use_frac != 0 and not border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
         v = vel[i, j, k]
         f = frac[i, j, k]
         fx = frac[i + 1, j, k][0]
@@ -390,13 +410,13 @@ def _rhs_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype=wp.vec3
             s += (1.0 - f[1]) * o[1] - (1.0 - fy) * obvel[i, j + 1, k][1]
             s += (1.0 - f[2]) * o[2] - (1.0 - fz) * obvel[i, j, k + 1][2]
         s += div[0]
-    elif not _border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
+    elif not border(i, j, k, nx, ny, nz) and (flags[i, j, k] & FLUID) != 0:
         v = vel[i, j, k]
         s = (v[0] - vel[i + 1, j, k][0]) + (v[1] - vel[i, j + 1, k][1])
         s += v[2] - vel[i, j, k + 1][2] + div[0]
-    if use_divg != 0 and (flags[i, j, k] & FLUID) != 0 and not _border(i, j, k, nx, ny, nz):
+    if use_divg != 0 and (flags[i, j, k] & FLUID) != 0 and not border(i, j, k, nx, ny, nz):
         s += divg[i, j, k]
-    if use_st != 0 and (flags[i, j, k] & FLUID) != 0 and not _border(i, j, k, nx, ny, nz):
+    if use_st != 0 and (flags[i, j, k] & FLUID) != 0 and not border(i, j, k, nx, ny, nz):
         t = st[0]
         ph = phi[i, j, k]
         c = curv[i, j, k]
@@ -421,14 +441,16 @@ def _rhs_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype=wp.vec3
 def _correct_vel_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype=wp.vec3),
                         p: wp.array3d(dtype=wp.float32), phi: wp.array3d(dtype=wp.float32),
                         use_phi: int, curv: wp.array3d(dtype=wp.float32),
-                        st: wp.array(dtype=wp.float32), use_st: int):
+                        st: wp.array(dtype=wp.float32), use_st: int,
+                        wts: wp.array3d(dtype=wp.vec3), use_w: int):
     """knCorrectVelocity (bnd 1). Faces between fluid and plain OUTFLOW cells
     are left alone, as in Mantaflow (OUTFLOW cells are neither fluid nor empty).
     use_phi: knCorrectVelocityGhostFluid fused in; use_st (needs use_phi): its
-    surface tension part."""
+    surface tension part. use_w (not with use_phi): u -= w grad p, w = the face
+    weight of each lower face (all faces this cell writes)."""
     i, j, k = wp.tid()
     nx, ny, nz = flags.shape[0], flags.shape[1], flags.shape[2]
-    if _border(i, j, k, nx, ny, nz):
+    if border(i, j, k, nx, ny, nz):
         return
     f = flags[i, j, k]
     v = vel[i, j, k]
@@ -436,19 +458,22 @@ def _correct_vel_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype
     vy = v[1]
     vz = v[2]
     pc = p[i, j, k]
+    w = wp.vec3(1.0, 1.0, 1.0)
+    if use_w != 0:
+        w = wts[i, j, k]
     if (f & FLUID) != 0:
         if (flags[i - 1, j, k] & FLUID) != 0:
-            vx -= pc - p[i - 1, j, k]
+            vx -= w[0] * (pc - p[i - 1, j, k])
         if (flags[i, j - 1, k] & FLUID) != 0:
-            vy -= pc - p[i, j - 1, k]
+            vy -= w[1] * (pc - p[i, j - 1, k])
         if (flags[i, j, k - 1] & FLUID) != 0:
-            vz -= pc - p[i, j, k - 1]
+            vz -= w[2] * (pc - p[i, j, k - 1])
         if (flags[i - 1, j, k] & EMPTY) != 0:
-            vx -= pc
+            vx -= w[0] * pc
         if (flags[i, j - 1, k] & EMPTY) != 0:
-            vy -= pc
+            vy -= w[1] * pc
         if (flags[i, j, k - 1] & EMPTY) != 0:
-            vz -= pc
+            vz -= w[2] * pc
         if use_phi != 0:
             ph = phi[i, j, k]
             if (flags[i - 1, j, k] & EMPTY) != 0:
@@ -471,19 +496,19 @@ def _correct_vel_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype
         if use_phi != 0:
             ph = phi[i, j, k]
         if (flags[i - 1, j, k] & FLUID) != 0:
-            vx += p[i - 1, j, k]
+            vx += w[0] * p[i - 1, j, k]
             if use_phi != 0:
                 vx -= p[i - 1, j, k] * _ghost_fluid(phi[i - 1, j, k], ph)
         else:
             vx = 0.0
         if (flags[i, j - 1, k] & FLUID) != 0:
-            vy += p[i, j - 1, k]
+            vy += w[1] * p[i, j - 1, k]
             if use_phi != 0:
                 vy -= p[i, j - 1, k] * _ghost_fluid(phi[i, j - 1, k], ph)
         else:
             vy = 0.0
         if (flags[i, j, k - 1] & FLUID) != 0:
-            vz += p[i, j, k - 1]
+            vz += w[2] * p[i, j, k - 1]
             if use_phi != 0:
                 vz -= p[i, j, k - 1] * _ghost_fluid(phi[i, j, k - 1], ph)
         else:
@@ -533,7 +558,7 @@ def _apply_matrix_kernel(flags: wp.array3d(dtype=wp.int32), a0: wp.array3d(dtype
     nx, ny, nz = src.shape[0], src.shape[1], src.shape[2]
     prod = float(0.0)
     if t < nx * ny * nz:
-        c = _unravel(t, ny, nz)
+        c = unravel(t, ny, nz)
         i, j, k = c[0], c[1], c[2]
         v = src[i, j, k]
         if (flags[i, j, k] & FLUID) != 0:
@@ -557,12 +582,14 @@ def _cg_update_kernel(p: wp.array3d(dtype=wp.float32), r: wp.array3d(dtype=wp.fl
         alpha = sig[0] / dp
     m = float(0.0)
     if t < nx * ny * nz:
-        c = _unravel(t, ny, nz)
+        c = unravel(t, ny, nz)
         i, j, k = c[0], c[1], c[2]
         p[i, j, k] = p[i, j, k] + alpha * search[i, j, k]
         rv = r[i, j, k] - alpha * tmp[i, j, k]
         r[i, j, k] = rv
         m = wp.abs(rv)
+        if not wp.isfinite(m):  # tile_max and atomic_max skip NaN: make it trip the divergence guard
+            m = wp.inf
     tm = wp.tile_max(wp.tile(m))
     wp.atomic_max(res, 0, tm[0])
 
@@ -575,7 +602,7 @@ def _dot_kernel(a: wp.array3d(dtype=wp.float32), b: wp.array3d(dtype=wp.float32)
     nx, ny, nz = a.shape[0], a.shape[1], a.shape[2]
     prod = float(0.0)
     if t < nx * ny * nz:
-        c = _unravel(t, ny, nz)
+        c = unravel(t, ny, nz)
         prod = a[c[0], c[1], c[2]] * b[c[0], c[1], c[2]]
     wp.tile_atomic_add(sc, wp.tile_sum(wp.tile(wp.float64(prod))), offset=1)
 
@@ -707,7 +734,7 @@ def _mg_interp_add_kernel(tf: wp.array3d(dtype=wp.int32), xf: wp.array3d(dtype=w
 @wp.kernel
 def _mg_coarsest_kernel(act: wp.array(dtype=wp.vec3i), m: wp.array2d(dtype=wp.float32),
                         b: wp.array3d(dtype=wp.float32), x: wp.array3d(dtype=wp.float32)):
-    """Coarsest level: x = pinv(A) b over the active vertices."""
+    """Coarsest level: x = minv b over the active vertices (minv from _invert_coarsest)."""
     r = wp.tid()
     s = float(0.0)
     for c in range(act.shape[0]):
@@ -882,6 +909,20 @@ def _coarsen_kernel(tf: wp.array3d(dtype=wp.int32), tc: wp.array3d(dtype=wp.int3
                     tc[x, y, z] = VT_INACTIVE
 
 
+@wp.kernel
+def _coarsen_parallel_kernel(tf: wp.array3d(dtype=wp.int32), tc: wp.array3d(dtype=wp.int32)):
+    """A coarse vertex is active when any fine vertex in its restriction stencil is
+    active (not Mantaflow's rule; see `parallel_coarsening` in MGPressureSolver.solve)."""
+    i, j, k = wp.tid()
+    t = VT_INACTIVE
+    for z in range(wp.max(0, 2 * k - 1), wp.min(tf.shape[2] - 1, 2 * k + 1) + 1):
+        for y in range(wp.max(0, 2 * j - 1), wp.min(tf.shape[1] - 1, 2 * j + 1) + 1):
+            for x in range(wp.max(0, 2 * i - 1), wp.min(tf.shape[0] - 1, 2 * i + 1) + 1):
+                if tf[x, y, z] != VT_INACTIVE:
+                    t = VT_ACTIVE
+    tc[i, j, k] = t
+
+
 def _coarse_types(t0: np.ndarray, sizes: list[tuple[int, int, int]]) -> list[np.ndarray]:
     """Run genCoarseGrid for every level on the CPU; returns int32 type grids."""
     cpu = wp.get_device("cpu")
@@ -908,12 +949,41 @@ def _level_sizes(shape) -> list[tuple[int, int, int]]:
     return sizes
 
 
+# Eigenvalues below this fraction of the largest count as zero on the coarsest level. Its matrix
+# holds float32 Galerkin values, so a block that should be singular (closed domain or sealed pocket
+# with no pinned cell) keeps an eigenvalue of 1e-11 to 3e-8 of the largest; inverting that stalls CG.
+# Well-posed matrices measured at 128-cubed stay above 9e-5 (CODE-GAS-011).
+COARSEST_RCOND = 1e-6
+
+
+def _invert_coarsest(dense: np.ndarray) -> np.ndarray:
+    """Inverse of the coarsest matrix, about 5 times cheaper than a pseudo-inverse (CODE-GAS-002).
+    It is kept only when A @ inv maps three random vectors back to themselves to 1e-6 and the
+    Frobenius condition number, an upper bound on the 2-norm one, is below 1 / COARSEST_RCOND, so
+    the pseudo-inverse would discard nothing and the two agree to rounding. A singular matrix
+    (closed domain without a pinned cell) fails that and takes the pseudo-inverse. The check is
+    matrix-vector because a full A @ inv costs more than the inverse with the NumPy bundled in
+    Blender."""
+    if dense.size == 0:
+        return dense.copy()
+    try:
+        with np.errstate(all="ignore"):
+            inv = np.linalg.inv(dense)
+            probe = np.random.default_rng(0).standard_normal((len(dense), 3))
+            err = np.abs(dense @ (inv @ probe) - probe).max()
+            cond = np.linalg.norm(dense) * np.linalg.norm(inv)
+        if np.isfinite(err) and err < 1e-6 and cond < 1.0 / COARSEST_RCOND:
+            return inv
+    except np.linalg.LinAlgError:
+        pass
+    return np.linalg.pinv(dense, COARSEST_RCOND, True)  # positional: the keyword differs across NumPy
+
+
 def _dense_coarsest(a: np.ndarray, t: np.ndarray):
-    """Dense matrix of the coarsest level over its active vertices, pseudo-inverted."""
+    """Dense matrix of the coarsest level over its active vertices, inverted. _level_sizes keeps that
+    level at 1000 vertices or fewer."""
     act = np.argwhere(t != 0)
     m = len(act)
-    if m > MAX_COARSEST:
-        raise RuntimeError(f"multigrid coarsest level has {m} active vertices (limit {MAX_COARSEST})")
     index = np.full(t.shape, -1, np.int64)
     index[tuple(act.T)] = np.arange(m)
     dense = np.zeros((m, m), np.float64)
@@ -934,7 +1004,17 @@ def _dense_coarsest(a: np.ndarray, t: np.ndarray):
                     vals = a[tuple(nb[rows].T) + (13 - s,)]
                 dense[rows, cols] = vals
     dense = 0.5 * (dense + dense.T)  # symmetric by construction; remove rounding noise
-    return act.astype(np.int32), np.linalg.pinv(dense, hermitian=True).astype(np.float32)
+    return act.astype(np.int32), _invert_coarsest(dense).astype(np.float32)
+
+
+def _dense_level0(a0: np.ndarray, ai: np.ndarray, aj: np.ndarray, ak: np.ndarray, t: np.ndarray):
+    """Dense inverse for a grid so small that level 0 is also the coarsest (CODE-GAS-005). Puts the
+    7-point matrix in the 14-entry storage _coef reads (index s - 13: +x = 1, +y = 3, +z = 9). Trivial
+    rows keep the diagonal 1 and the V-cycle passes the unscaled residual, so they give x = b as the
+    scaled equation does, and the inverse's conditioning check is not misled by a 1e-6 diagonal."""
+    a = np.zeros(t.shape + (14,), np.float32)
+    a[..., 0], a[..., 1], a[..., 3], a[..., 9] = a0, ai, aj, ak
+    return _dense_coarsest(a, t)
 
 
 # ---- solver ------------------------------------------------------------------------
@@ -946,6 +1026,7 @@ class MGPressureSolver:
         self.shape = tuple(int(s) for s in shape)
         self.device = device
         self.builds = 0  # how many times the matrix/hierarchy was (re)built
+        self.build_ms = {}  # last build: matrix, coarsen, galerkin, coarsest, total (milliseconds)
         self.use_graph = device.is_cuda
         self._graphs = {}  # name -> (grid pointers, captured CUDA graph)
         self._key = None  # (pins a cell, fractions build key) of the current build
@@ -953,6 +1034,9 @@ class MGPressureSolver:
         self._dummy_vec = wp.zeros((1, 1, 1), dtype=wp.vec3, device=device)
         self._dummy_scalar = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
         self.phi = None  # ghost-fluid level set of the current build
+        self.wts = None  # per-face weights (1/rho) of the current build, or None
+        self._wkey = None  # (ptr, gen) of the weights in the current build
+        self._t0_old = None  # level-0 types before a weights-only rebuild
         self.curv = None  # surface tension curvature (with phi) or None
         d, sh = device, self.shape
         f32 = wp.float32
@@ -982,7 +1066,7 @@ class MGPressureSolver:
 
     def nbytes(self) -> int:
         arrays = [self.a0, self.ai, self.aj, self.ak, self.residual, self.search, self.r0, self.snap,
-                  *self.t, *self.x, *self.b[1:], *self.r[1:], *self.a[1:], self.act, self.minv]
+                  *self.t, *self.x, *self.b[1:], *self.r[1:], *self.a[1:], self.act, self.minv, self._t0_old]
         return sum(a.capacity for a in arrays if a is not None)
 
     # ---- setup ----
@@ -1012,37 +1096,76 @@ class MGPressureSolver:
         k, j, i = hits[0]
         return (int(i) + 1, int(j) + 1, int(k) + 1)
 
-    def _build(self, flags, pin_needed: bool):
-        d = self.device
-        wp.launch(_layout_kernel, dim=self.shape, inputs=[flags, self.snap, 1, self.changed], device=d)
-        frac = self._dummy_vec if self.frac is None else self.frac
-        wp.launch(_laplace_kernel, dim=self.shape, inputs=[flags, self.a0, self.ai, self.aj, self.ak,
-                                                           frac, int(self.frac is not None)],
-                  device=d)
-        if self.phi is not None:
-            wp.launch(_ghost_diag_kernel, dim=self.shape, inputs=[flags, self.phi, self.a0], device=d)
-        self.pin = None
-        if pin_needed:
-            self.pin = self._pin_cell(flags.numpy())
-            if self.pin is not None:
-                wp.launch(_pin_kernel, dim=1, inputs=[self.a0, self.ai, self.aj, self.ak,
-                                                      wp.vec3i(*self.pin)], device=d)
-        wp.launch(_types0_kernel, dim=self.shape, inputs=[self.a0, self.ai, self.aj, self.ak, self.t[0]],
-                  device=d)
+    def _coarsen(self, parallel: bool):
+        """Fill the type grids self.t[1:] from self.t[0]."""
+        if parallel:
+            for l in range(1, len(self.sizes)):
+                wp.launch(_coarsen_parallel_kernel, dim=self.sizes[l],
+                          inputs=[self.t[l - 1], self.t[l]], device=self.device)
+            return
         types = _coarse_types(self.t[0].numpy(), self.sizes)
         for l in range(1, len(self.sizes)):
             self.t[l].assign(types[l])
+
+    def _build(self, flags, pin_needed: bool, parallel: bool, weights_only: bool = False):
+        """weights_only: same flags and keys, new face weights. The pin cell stays and
+        the coarse types are only rebuilt if the level-0 types changed."""
+        d = self.device
+        t_start = time.perf_counter()
+        if weights_only:
+            if self._t0_old is None:
+                self._t0_old = wp.zeros(self.shape, dtype=wp.int32, device=d)
+            wp.copy(self._t0_old, self.t[0])
+        else:
+            wp.launch(_layout_kernel, dim=self.shape, inputs=[flags, self.snap, 1, self.changed], device=d)
+        frac = self._dummy_vec if self.frac is None else self.frac
+        wts = self._dummy_vec if self.wts is None else self.wts
+        wp.launch(_laplace_kernel, dim=self.shape, inputs=[flags, self.a0, self.ai, self.aj, self.ak,
+                                                           frac, int(self.frac is not None),
+                                                           wts, int(self.wts is not None)],
+                  device=d)
+        if self.phi is not None:
+            wp.launch(_ghost_diag_kernel, dim=self.shape, inputs=[flags, self.phi, self.a0], device=d)
+        if not weights_only:
+            self.pin = self._pin_cell(flags.numpy()) if pin_needed else None
+        if self.pin is not None:
+            wp.launch(_pin_kernel, dim=1, inputs=[self.a0, self.ai, self.aj, self.ak,
+                                                  wp.vec3i(*self.pin)], device=d)
+        wp.launch(_types0_kernel, dim=self.shape, inputs=[self.a0, self.ai, self.aj, self.ak, self.t[0]],
+                  device=d)
+        wp.synchronize_device(d)
+        t_matrix = time.perf_counter()
+        recoarsen = True
+        if weights_only:
+            self.changed.zero_()
+            wp.launch(_types_changed_kernel, dim=self.shape, inputs=[self.t[0], self._t0_old, self.changed],
+                      device=d)
+            recoarsen = bool(self.changed.numpy()[0])
+        if recoarsen:
+            self._coarsen(parallel)
+        wp.synchronize_device(d)
+        t_coarsen = time.perf_counter()
+        for l in range(1, len(self.sizes)):
             wp.launch(_mg_galerkin_kernel, dim=self.sizes[l],
                       inputs=[self.t[l - 1], self._dummy4 if l == 1 else self.a[l - 1],
                               self.a0, self.ai, self.aj, self.ak, int(l == 1), self.t[l], self.a[l]],
                       device=d)
         last = len(self.sizes) - 1
+        wp.synchronize_device(d)
+        t_galerkin = time.perf_counter()
         if last == 0:
-            raise RuntimeError("pressure solve needs a grid larger than 1000 cells")
-        act, minv = _dense_coarsest(self.a[last].numpy(), types[last])
+            act, minv = _dense_level0(self.a0.numpy(), self.ai.numpy(), self.aj.numpy(), self.ak.numpy(),
+                                      self.t[0].numpy())
+        else:
+            act, minv = _dense_coarsest(self.a[last].numpy(), self.t[last].numpy())
         self.act = wp.array(act.reshape(-1, 3), dtype=wp.vec3i, device=d)
         self.minv = wp.array(minv, dtype=wp.float32, device=d)
         self.builds += 1
+        t_end = time.perf_counter()
+        self.build_ms = {name: (b - a) * 1000 for name, a, b in (
+            ("matrix", t_start, t_matrix), ("coarsen", t_matrix, t_coarsen),
+            ("galerkin", t_coarsen, t_galerkin), ("coarsest", t_galerkin, t_end),
+            ("total", t_start, t_end))}
 
     # ---- per solve ----
 
@@ -1066,7 +1189,7 @@ class MGPressureSolver:
             wp.launch(_mg_restrict_kernel, dim=self.sizes[l + 1],
                       inputs=[self.t[l], self.r[l], self.t[l + 1], self.b[l + 1], self.x[l + 1]], device=d)
         wp.launch(_mg_coarsest_kernel, dim=self.act.shape[0],
-                  inputs=[self.act, self.minv, self.b[top], self.x[top]], device=d)
+                  inputs=[self.act, self.minv, self.b[top] if top else self.residual, self.x[top]], device=d)
         for l in range(top - 1, -1, -1):
             wp.launch(_mg_interp_add_kernel, dim=self.sizes[l],
                       inputs=[self.t[l], self.x[l], self.t[l + 1], self.x[l + 1]], device=d)
@@ -1136,12 +1259,21 @@ class MGPressureSolver:
     def solve(self, flags, vel, pressure, accuracy, zero_pressure_fixing,
               divergence=0.0, fractions=None, obvel=None, fractions_gen=0,
               phi=None, phi_gen=0, divergence_grid=None, curv=None,
-              surface_tension=0.0) -> PressureStats:
+              surface_tension=0.0, parallel_coarsening=False, face_weights=None,
+              weights_gen=0) -> PressureStats:
         """fractions: face fractions (Mantaflow's MACGrid) or None; the matrix is
         rebuilt when the flags, `fractions_gen` or `phi_gen` change. obvel only counts
         with fractions. phi: ghost-fluid free surface (matrix diagonal and correction).
         divergence_grid: per-cell target divergence added to the rhs, or None.
-        curv (with phi): curvature for the surface tension jump `surface_tension` * curv."""
+        curv (with phi): curvature for the surface tension jump `surface_tension` * curv.
+        parallel_coarsening: pick the coarse vertices on the GPU instead of Mantaflow's
+        serial CPU pass (High Quality only; Classic stays reproducible).
+        face_weights (not in Mantaflow; not with phi): vec3 grid, weight w of the lower
+        face per axis; solves div(w grad p) = div u and corrects u -= w grad p (the
+        rhs stays the plain or fraction-weighted divergence). The matrix is rebuilt
+        when `weights_gen` changes."""
+        if face_weights is not None and phi is not None:
+            raise ValueError("face_weights cannot be combined with the ghost-fluid phi")
         d = self.device
         if divergence != self._div_value:
             self.div.fill_(divergence)
@@ -1150,16 +1282,22 @@ class MGPressureSolver:
         self.frac = fractions
         self.obvel = obvel if fractions is not None else None
         self.phi = phi
+        self.wts = face_weights
         self.curv = curv if phi is not None and surface_tension != 0.0 else None
         if self.curv is not None and surface_tension != self._st_value:
             self.st.fill_(surface_tension)
             self._st_value = surface_tension
         pin_needed = bool(zero_pressure_fixing or accuracy < 1e-7)
-        build_key = (pin_needed, None if fractions is None else (fractions.ptr, fractions_gen),
-                     None if phi is None else (phi.ptr, phi_gen))
+        build_key = (pin_needed, bool(parallel_coarsening), None if fractions is None else (fractions.ptr, fractions_gen),
+                     None if phi is None else (phi.ptr, phi_gen), face_weights is not None)
+        wkey = None if face_weights is None else (face_weights.ptr, weights_gen)
         if self._needs_build(flags, build_key):
-            self._build(flags, pin_needed)
-            self._key = build_key
+            self._build(flags, pin_needed, bool(parallel_coarsening))
+            self._key, self._wkey = build_key, wkey
+            self._graphs = {}
+        elif wkey != self._wkey:
+            self._build(flags, pin_needed, bool(parallel_coarsening), weights_only=True)
+            self._wkey = wkey
             self._graphs = {}
         pin = wp.vec3i(*self.pin) if self.pin is not None else wp.vec3i(-1, -1, -1)
         self.p = pressure
@@ -1177,12 +1315,15 @@ class MGPressureSolver:
             if resnorm < accuracy:
                 break
             if not resnorm < 1e35:
-                raise RuntimeError("pressure solve diverged (residual > 1e35)")
+                raise RuntimeError("pressure solve failed: the velocity field contains NaN or infinity, "
+                                   "or the solve diverged")
 
         wp.launch(_correct_vel_kernel, dim=self.shape,
                   inputs=[flags, vel, pressure, self._dummy_scalar if phi is None else phi,
                           int(phi is not None), self._dummy_scalar if self.curv is None else self.curv,
-                          self.st, int(self.curv is not None)], device=d)
+                          self.st, int(self.curv is not None),
+                          self._dummy_vec if face_weights is None else face_weights,
+                          int(face_weights is not None)], device=d)
         if phi is not None:
             wp.launch(_replace_clamped_kernel, dim=self.shape, inputs=[flags, vel, phi], device=d)
         return PressureStats(iterations=it, residual=resnorm)

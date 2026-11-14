@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import subprocess
+import tempfile
 
 import bpy
 from bpy.types import Operator
@@ -15,7 +16,7 @@ from .openbillow import __version__
 from .props import prefs
 
 ISSUES = "https://github.com/LittleRags/openbillow-public/issues"
-MAX_DIAG = 32 * 1024
+MAX_DIAG = 32_000  # the support server refuses anything longer
 MAX_LOG = 64 * 1024
 
 
@@ -82,6 +83,32 @@ def _domain_settings(ob):
     return out
 
 
+def _cache_writable(folder):
+    """Can a bake write there? Tries a real file in the folder, or in its nearest existing parent."""
+    while not os.path.isdir(folder):
+        up = os.path.dirname(folder)
+        if up == folder or os.path.exists(folder):  # a file is in the way
+            return False
+        folder = up
+    try:
+        with tempfile.TemporaryFile(dir=folder) as fh:
+            fh.write(b"0")
+            fh.flush()
+    except OSError:
+        return False
+    return True
+
+
+def _vram_estimate(context, ob):
+    """The domain panel's figure, in MB. None if it cannot be worked out."""
+    try:
+        from .openbillow import estimate
+        return round(estimate.estimate_total_mb(ops.domain_size(ob), ob.openbillow.domain.resolution_max,
+                                                **ops.estimate_args(context.scene, ob)))
+    except Exception:  # noqa: BLE001 - an estimate must not stop the report
+        return None
+
+
 def collect(context, want_log, want_errors=False, own_only=False, short_paths=False):
     """-> (diagnostics dict, log string or None). Blocks for the Warp probe (a few seconds)."""
     d = {"os": platform.platform(), "blender_version": bpy.app.version_string,
@@ -92,6 +119,8 @@ def collect(context, want_log, want_errors=False, own_only=False, short_paths=Fa
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         d["device_init_error"] = scrub(f"diagnostics probe failed: {e}")[:500]
     d["last_jit_error"] = None
+    d.update(warp_installed=ops.warp_available(), online_access=bpy.app.online_access, cache_dir_writable=None,
+             vram_estimate_mb=None, last_bake_exit_code=None)
     fix = (lambda t: reduce_paths(scrub(t))) if short_paths else scrub
     errs = errlog.recent() if want_errors else None
     if errs is not None and own_only:
@@ -101,11 +130,15 @@ def collect(context, want_log, want_errors=False, own_only=False, short_paths=Fa
     ob = ops.domain_of(context)
     if ob:
         d["domain"] = _domain_settings(ob)
+        d["vram_estimate_mb"] = _vram_estimate(context, ob)
         try:
             folder = ops.bake_folder(ob)
         except Exception:  # unsaved .blend with a relative cache folder
             folder = None
+            d["cache_dir_writable"] = False
         if folder:
+            d["cache_dir_writable"] = _cache_writable(folder)
+            d["last_bake_exit_code"] = (ops._last.get(folder) or {}).get("exit")
             d["last_jit_error"] = _jit_error(folder)
             if short_paths and d["last_jit_error"]:
                 d["last_jit_error"] = reduce_paths(d["last_jit_error"])
