@@ -22,12 +22,14 @@ from . import noise as _noise
 from .backend import Backend
 from .backend.base import Flags, Vec3
 from .forcefields import EffectorWeights, ForceField, interp_matrix
+from .meshes import mesh_area
 from .guiding import make_guiding
 from .meshes import cube, uv_sphere
 
 DT_DEFAULT = 0.1      # fluid.cc: frame length is 0.1 solver units at 25 fps
 FLT_EPSILON = 1.1920929e-07
 VECTOR_EPSILON = 1e-6
+SQRT3 = 1.732         # fluid.cc sample_mesh: nearest-surface search distance, cells
 
 
 class SimulationDiverged(RuntimeError):
@@ -47,6 +49,23 @@ class MeshObject:
     tris: np.ndarray                # (m, 3) vertex indices, outward winding
     matrix: np.ndarray              # (4, 4) or (k, 4, 4) object → world
     frames: np.ndarray | None = None
+    # Keyframed flow strength (CODE-ADD-036): {name: (k,) samples} at scene times `anim_times`, names from
+    # ANIM_FIELDS; any other attribute stays plain. A vector (velocity_coord) is keyed as name_0..2.
+    anim_times: np.ndarray | None = None
+    anim: dict | None = None
+
+    def value(self, name: str, t: float) -> float:
+        a = self.anim.get(name) if self.anim else None
+        if a is None:
+            return getattr(self, name)
+        return float(interp_matrix(a, self.anim_times, t))
+
+    def vec(self, name: str, t: float) -> tuple:
+        base = getattr(self, name)
+        if not self.anim:
+            return tuple(base)
+        return tuple(float(interp_matrix(self.anim[f"{name}_{i}"], self.anim_times, t))
+                     if f"{name}_{i}" in self.anim else base[i] for i in range(3))
 
     @property
     def animated(self) -> bool:
@@ -69,6 +88,14 @@ class MeshFlow(MeshObject):
     fuel_amount: float = 1.0        # Blender "Flame Rate"
     emit_start: int = 0             # emits while emit_start <= frame <= emit_end (emit_end 0: always);
     emit_end: int = 0               # a short range = burst/explosion
+    use_initial_velocity: bool = False  # Blender "Initial Velocity": the emission shell pushes the gas
+    velocity_factor: float = 1.0        # Blender "Source" (times the object's velocity)
+    velocity_normal: float = 0.0        # along the surface normal, cells per solver time as Blender
+    velocity_coord: Vec3 = (0.0, 0.0, 0.0)  # Blender "Initial X/Y/Z", m/s
+ANIM_GAS = ("density", "temperature", "fuel_amount", "velocity_factor", "velocity_normal")
+ANIM_LIQUID = ("velocity_factor", "velocity_normal")
+_COORD = tuple(f"velocity_coord_{i}" for i in range(3))
+ANIM_FIELDS = ANIM_GAS + _COORD  # everything a flow can key, in storage order
 
 
 @dataclass
@@ -230,7 +257,7 @@ class DomainSettings(GuideSettings):
     # disturbance, shredding and flame vorticity do not apply. use_viscosity applies as for
     # FLAME_FRONT. 3D only; no noise or guiding. Defaults: the FDS pool3d propane pool (1950 kW
     # on 1 m^2; reaction constants from FDS 6.11.1 pool3d.out, soot yield from its input).
-    diffusion_hrrpua: float = 1950.0              # kW/m^2 of emitter footprint (x-y plane)
+    diffusion_hrrpua: float = 1950.0              # kW/m^2 of the flow meshes' surface area
     diffusion_heat_of_combustion: float = 46.007  # MJ/kg
     diffusion_air_fuel_ratio: float = 15.592      # kg air per kg fuel (stoichiometric)
     diffusion_radiative_fraction: float = 0.29    # share of the heat lost to radiation
@@ -276,7 +303,8 @@ class DomainSettings(GuideSettings):
                 "flame_front": self.fire_model == "FLAME_FRONT",
                 "mixture_fraction": self.fire_model == "DIFFUSION",
                 "gas_viscosity": self.fire_model in ("FLAME_FRONT", "DIFFUSION") and self.use_viscosity,
-                "high_quality": self.quality == "HIGH"}
+                "high_quality": self.quality == "HIGH",
+                "initial_velocity": any(f.use_initial_velocity for f in self.flows)}
 
 
 @dataclass
@@ -428,6 +456,8 @@ class SmokeSolver(_FrameStepper):
         self.density_in = b.scalar_grid(sh)
         self.heat_in = b.scalar_grid(sh)
         self.emission_in = b.scalar_grid(sh)
+        # Blender invelC: cell-centred initial velocity, only when a flow sets one.
+        self.invel = b.vector_grid(sh) if any(f.use_initial_velocity for f in s.flows) else None
         # Fire grids (smoke_script.h `using_fire`). Blender also turns fire on
         # for SMOKE flows with a fuel amount; that changes nothing without fuel,
         # so we only allocate them for FIRE/BOTH flows. `flame` doubles as the
@@ -477,6 +507,9 @@ class SmokeSolver(_FrameStepper):
         self.world_to_cell = np.diag([1.0 / self.dx] * 3 + [1.0])
         self.world_to_cell[:3, 3] = -np.asarray(s.min_corner, float) / self.dx
         self._flow_meshes = [b.create_mesh(f.verts, f.tris) for f in s.flows]
+        # DIFFUSION releases diffusion_hrrpua per m^2 of these (static flows: fixed).
+        self._flow_areas = [None if f.animated else mesh_area(f.verts, f.tris, f.matrix_at(1.0)) for f in s.flows]
+        self._emit_area = 0.0
         for f, m in zip(s.flows, self._flow_meshes):
             if not f.animated:
                 b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(1.0))
@@ -628,7 +661,7 @@ class SmokeSolver(_FrameStepper):
 
     # ---- one substep -------------------------------------------------------
 
-    def _rasterize_flows(self, t: float) -> None:
+    def _rasterize_flows(self, t: float, dt: float = 0.0) -> None:
         """Blender `update_flowsfluids` at scene time t: phi_in, emission_in, density_in,
         heat_in (and fuel_in, react_in with fire). The *_in grids start as copies
         of the simulation grids and each flow raises them in its emission shell
@@ -642,17 +675,28 @@ class SmokeSolver(_FrameStepper):
         if self.fire:
             b.copy(self.fuel_in, self.fuel)
             b.copy(self.react_in, self.react)
-        for f, m in zip(self.s.flows, self._flow_meshes):
+        self._emit_area = 0.0
+        if self.invel is not None:
+            b.fill(self.invel, (0.0, 0.0, 0.0))
+        for f, m, a in zip(self.s.flows, self._flow_meshes, self._flow_areas):
             if f.emit_end and not (f.emit_start - 1 < t <= f.emit_end):
                 continue
-            if f.animated:
-                b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(t))
+            if f.animated:  # dt: mesh velocity for the Source factor of an initial velocity
+                b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(t), dt)
+                if self.diffusion:
+                    a = mesh_area(f.verts, f.tris, f.matrix_at(t))
+            self._emit_area += a or 0.0
             b.rasterize_mesh_flow(m, self.phi_in, self.emission_in, self.density_in,
                                   self.heat_in, self.density, self.heat,
-                                  0.0 if f.flow_type == "FIRE" else f.density,
-                                  f.temperature, f.surface_distance, f.volume_density,
+                                  0.0 if f.flow_type == "FIRE" else f.value("density", t),
+                                  f.value("temperature", t), f.surface_distance, f.volume_density,
                                   f.plane_init, self.fuel_in, self.react_in, self.fuel,
-                                  self.react, f.fuel_amount, f.flow_type != "SMOKE")
+                                  self.react, f.value("fuel_amount", t), f.flow_type != "SMOKE")
+            if f.use_initial_velocity:
+                # sample_mesh: velocity only where the surface emission is nonzero (Blender's gas rule)
+                b.rasterize_flow_velocity(m, self.invel, min(SQRT3, f.surface_distance),
+                                          f.value("velocity_normal", t), f.value("velocity_factor", t),
+                                          tuple(v * self.vel_scale for v in f.vec("velocity_coord", t)))
 
     def _rasterize_moving_obstacles(self, t: float, dt: float) -> None:
         """Blender `update_obstacles` + the obstacle part of `smoke_step` for
@@ -672,7 +716,7 @@ class SmokeSolver(_FrameStepper):
         scale = dt / self.frame_length_unscaled
 
         t = self._flow_time(dt)
-        self._rasterize_flows(t)
+        self._rasterize_flows(t, dt)
         if self.noise:
             self.noise.substep_start()
         if self._moving:
@@ -685,7 +729,7 @@ class SmokeSolver(_FrameStepper):
         b.apply_emission(flags, self.density, self.density_in, self.emission_in)
         b.apply_emission(flags, self.heat, self.heat_in, self.emission_in)
         if self.diffusion:  # fuel and react are Y_F and Y_P: the source enters as mass, not by emission
-            b.mixfrac_source(self.mixfrac, flags, self.phi_in, s.diffusion_hrrpua)
+            b.mixfrac_source(self.mixfrac, flags, self.phi_in, s.diffusion_hrrpua, self._emit_area)
             b.mixfrac_burn(self.mixfrac, flags, vel, self.fuel, self.react, self.heat, self.density,
                            self.expansion_div, scale / s.fps)
         elif self.fire:
@@ -799,6 +843,8 @@ class SmokeSolver(_FrameStepper):
         if self.flame_front and self.flame_inject_c:
             # Fuel gas enters as a mass source (a velocity set in the emitter is undone by the projection).
             b.fuel_mass_source(flags, self.phi_in, self.expansion_div, self.flame_inject_c)
+        if self.invel is not None:  # Mantaflow setInitialVelocity, after the forces, before the walls
+            b.set_initial_velocity(flags, vel, self.invel)
 
     def _project(self, final: bool) -> tuple[int, int | None]:
         """Wall BCs and the pressure solve (guided only when `final`); the flame update

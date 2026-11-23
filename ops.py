@@ -230,7 +230,7 @@ def update_volume(ob, folder, status):
         if not liquid:
             vol.materials.append(ob.openbillow.domain.material or
                              _volume_material(ob.openbillow.domain.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION"),
-                             emission_scale(ob)))
+                             emission_scale(ob), **_look_args(ob)))
     vol = vo.data
     first = os.path.join(folder, "vdb", "openbillow_%04d.vdb" % f0)
     if bpy.data.filepath:
@@ -338,15 +338,17 @@ def emission_scale(ob):
     return float("%.3g" % max(1.0, EMISSION_REF_LENGTH / L))
 
 
-def _material(name, smoke, flame, kelvin=False, scale=1.0):
+def _material(name, smoke, flame, kelvin=False, scale=1.0, force=False):
     """Volume material from the bake's `density` and `flame` grids (`temperature` in K when `kelvin`,
-    the Combustion model). Users can replace it."""
+    the Combustion model). Users can replace it. Look nodes carry stable names (see LOOK_NODES in ui.py);
+    `force` rebuilds an existing material in place (Reset look)."""
     if scale != 1.0:
         name = "%s x%g" % (name, scale)
     m = bpy.data.materials.get(name)
-    if m:
+    if m and not force:
         return m
-    m = bpy.data.materials.new(name)
+    m = m or bpy.data.materials.new(name)
+    m["openbillow_generated"] = True
     m.use_nodes = True
     nt = m.node_tree
     nt.nodes.clear()
@@ -385,13 +387,16 @@ def _material(name, smoke, flame, kelvin=False, scale=1.0):
     if smoke:  # dark grey smoke driven by density
         pv = nt.nodes.new("ShaderNodeVolumePrincipled")
         pv.location = (300, 300)
+        pv.name = "Smoke shader"
         pv.inputs["Color"].default_value = (0.12, 0.12, 0.12, 1.0)
-        nt.links.new(math("MULTIPLY", attr("density", 300).outputs["Fac"], 5.0, -400, 300),
-                     pv.inputs["Density"])
+        dm = math("MULTIPLY", attr("density", 300).outputs["Fac"], 5.0, -400, 300)
+        dm.node.name = "Smoke density"
+        nt.links.new(dm, pv.inputs["Density"])
         shaders.append(pv.outputs["Volume"])
     if flame:  # emission only: blackbody colour from the flame grid, no density of its own
         pv = nt.nodes.new("ShaderNodeVolumePrincipled")
         pv.location = (300, -300)
+        pv.name = "Flame shader"
         pv.inputs["Density"].default_value = 0.0
         pv.inputs["Blackbody Intensity"].default_value = 1.0
         if kelvin:  # Combustion: the grid is real Kelvin (0 where cold)
@@ -401,7 +406,9 @@ def _material(name, smoke, flame, kelvin=False, scale=1.0):
             tk = attr("temperature", -300).outputs["Fac"]
             bb = nt.nodes.new("ShaderNodeBlackbody")
             bb.location = (0, -150)
-            nt.links.new(math("MULTIPLY", tk, 1.25, -400, -100), bb.inputs["Temperature"])
+            tm = math("MULTIPLY", tk, 1.25, -400, -100)
+            tm.node.name = "Flame colour temperature"
+            nt.links.new(tm, bb.inputs["Temperature"])
             nt.links.new(bb.outputs["Color"], pv.inputs["Emission Color"])
             mr = nt.nodes.new("ShaderNodeMapRange")
             mr.location = (-400, -450)
@@ -414,6 +421,7 @@ def _material(name, smoke, flame, kelvin=False, scale=1.0):
             fl = attr("flame", -300).outputs["Fac"]
             mr = nt.nodes.new("ShaderNodeMapRange")  # flame 0..1 -> 800..1800 K: red to yellow
             mr.location = (-400, -450)
+            mr.name = "Flame temperature range"
             mr.inputs["To Min"].default_value, mr.inputs["To Max"].default_value = 800.0, 1800.0
             nt.links.new(fl, mr.inputs["Value"])
             nt.links.new(mr.outputs["Result"], pv.inputs["Temperature"])
@@ -430,15 +438,118 @@ def _material(name, smoke, flame, kelvin=False, scale=1.0):
     return m
 
 
-def _volume_material(combustion=False, scale=1.0):
+def _look_args(ob):
+    d = ob.openbillow.domain
+    candle = d.fire_model == "DIFFUSION" and d.diffusion_look == "CANDLE"
+    if not candle:
+        return {"candle": False, "wick_z": 0.0}
+    # The highest Candle Wick tip in the scene (CODE-ADD-034), else the domain's bottom face.
+    tips = [o.matrix_world.translation.z + o.openbillow.flow.wick_length
+            for o in scene_objects(bpy.context.scene, "FLOW") if o.openbillow.flow.use_wick]
+    return {"candle": True, "wick_z": max(tips) if tips else ob.matrix_world.translation.z - ob.dimensions.z / 2}
+
+
+def _candle_material(scale=1.0, wick_z=0.0, force=False):
+    """Candle look for a DIFFUSION bake (reads `temperature` and `fuel`): light only from soot (fuel present,
+    hot, above the wick tip), a thin blue sheet below it; hot clear products stay dark. Same nodes as
+    research/candle_flicker/candle_render.py (Andre's choice 2026-11-16: soot 35, blue 25, ramp 0..6 mm)."""
+    name = "OpenBillow Candle" + (" x%g" % scale if scale != 1.0 else "")
+    m = bpy.data.materials.get(name)
+    if m and not force:
+        return m
+    m = m or bpy.data.materials.new(name)
+    m["openbillow_generated"] = True
+    m.use_nodes = True
+    nt = m.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+
+    def at(n):
+        a = nt.nodes.new("ShaderNodeAttribute")
+        a.attribute_name = n
+        return a.outputs["Fac"]
+
+    def op(o, a, b, name=None):
+        n = nt.nodes.new("ShaderNodeMath")
+        n.operation = o
+        if name:
+            n.name = name
+        for i, v in enumerate((a, b)):
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                nt.links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    def ramp(v, lo, hi):
+        n = nt.nodes.new("ShaderNodeMapRange")
+        n.interpolation_type = "SMOOTHSTEP"
+        n.inputs["From Min"].default_value, n.inputs["From Max"].default_value = lo, hi
+        nt.links.new(v, n.inputs["Value"])
+        return n.outputs["Result"]
+
+    sc = nt.nodes.new("ShaderNodeValue")
+    sc.label = sc.name = "Emission scale"
+    sc.outputs[0].default_value = scale
+    wz = nt.nodes.new("ShaderNodeValue")
+    wz.label = wz.name = "Wick tip height"
+    wz.outputs[0].default_value = wick_z
+    T, F = at("temperature"), at("fuel")
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ")
+    nt.links.new(nt.nodes.new("ShaderNodeNewGeometry").outputs["Position"], sep.inputs[0])
+    h = op("SUBTRACT", sep.outputs["Z"], wz.outputs[0])  # height above the wick tip
+    up = ramp(h, 0.0, 0.006)  # 0 at the wick tip, 1 from 6 mm above
+    rich = op("MULTIPLY", ramp(F, 0.0, 0.01), op("SUBTRACT", 1.0, ramp(F, 0.08, 0.2)))
+    soot = op("MULTIPLY", op("MULTIPLY", rich, ramp(T, 1300.0, 2100.0)), up)
+    cr = nt.nodes.new("ShaderNodeValToRGB")  # orange, amber, pale yellow over 1300..2300 K
+    e = cr.color_ramp.elements
+    e[0].position, e[0].color = 0.0, (1.0, 0.25, 0.03, 1)
+    e[1].position, e[1].color = 1.0, (1.0, 0.92, 0.65, 1)
+    e.new(0.45).color = (1.0, 0.62, 0.18, 1)
+    nt.links.new(ramp(T, 1300.0, 2300.0), cr.inputs["Fac"])
+    em = nt.nodes.new("ShaderNodeEmission")
+    nt.links.new(cr.outputs["Color"], em.inputs["Color"])
+    ss = op("MULTIPLY", op("MULTIPLY", soot, 35.0, "Soot strength"), sc.outputs[0])
+    nt.links.new(ss, em.inputs["Strength"])
+    blue = op("MULTIPLY", op("MULTIPLY", ramp(T, 1200.0, 1800.0), op("SUBTRACT", 1.0, ramp(F, 0.02, 0.08))),
+              op("SUBTRACT", 1.0, up))
+    eb = nt.nodes.new("ShaderNodeEmission")
+    eb.inputs["Color"].default_value = (0.1, 0.25, 1.0, 1.0)
+    nt.links.new(op("MULTIPLY", op("MULTIPLY", blue, 25.0, "Blue strength"), sc.outputs[0]), eb.inputs["Strength"])
+    add = nt.nodes.new("ShaderNodeAddShader")
+    nt.links.new(em.outputs[0], add.inputs[0])
+    nt.links.new(eb.outputs[0], add.inputs[1])
+    nt.links.new(add.outputs[0], out.inputs["Volume"])
+    return m
+
+
+def _volume_material(combustion=False, scale=1.0, force=False, candle=False, wick_z=0.0):
     """Smoke + flame; also creates the separate Smoke and Flame materials to pick from.
-    `combustion` reads the Kelvin `temperature` grid instead of `flame`."""
+    `combustion` reads the Kelvin `temperature` grid instead of `flame`; `candle` the candle look."""
+    if candle:
+        return _candle_material(scale, wick_z, force)
     if combustion:
-        _material("OpenBillow Combustion Flame", False, True, kelvin=True, scale=scale)
-        return _material("OpenBillow Combustion Fire", True, True, kelvin=True, scale=scale)
-    _material("OpenBillow Smoke", True, False)
-    _material("OpenBillow Flame", False, True, scale=scale)
-    return _material("OpenBillow Fire", True, True, scale=scale)
+        _material("OpenBillow Combustion Flame", False, True, kelvin=True, scale=scale, force=force)
+        return _material("OpenBillow Combustion Fire", True, True, kelvin=True, scale=scale, force=force)
+    _material("OpenBillow Smoke", True, False, force=force)
+    _material("OpenBillow Flame", False, True, scale=scale, force=force)
+    return _material("OpenBillow Fire", True, True, scale=scale, force=force)
+
+
+def volume_object(ob):
+    vo = bpy.data.objects.get(ob.name + "_OpenBillow")
+    return vo if vo is not None and vo.type == "VOLUME" else None
+
+
+def reset_look(ob):
+    """Rebuild the generated volume material in place and put it back on the volume object."""
+    vo = volume_object(ob)
+    d = ob.openbillow.domain
+    m = _volume_material(d.fire_model in ("COMBUSTION", "FLAME_FRONT", "DIFFUSION"), emission_scale(ob), force=True,
+                         **_look_args(ob))
+    if vo is not None:
+        vo.data.materials.clear()
+        vo.data.materials.append(d.material or m)
 
 
 # ---- process + poll --------------------------------------------------------
@@ -514,6 +625,24 @@ def _sync_scene(r, st, finished):
         update_volume(ob, r["folder"], st)
     if finished and ob.openbillow.domain.refresh_vdb:
         refresh_volume(ob)
+        reload_cache_files(r["folder"])
+
+
+def reload_cache_files(folder):
+    """Make every CacheFile (USD/Alembic, e.g. imported particles) that points into this bake
+    folder re-open its file. A CacheFile whose file was missing when the .blend opened (a shipped
+    scene with //cache) stays empty until reloaded; reassigning the filepath does that."""
+    root = os.path.normcase(os.path.realpath(folder))
+    for cf in bpy.data.cache_files:
+        if cf.library is not None:
+            continue
+        path = os.path.normcase(os.path.realpath(bpy.path.abspath(cf.filepath)))
+        try:
+            inside = os.path.commonpath([root, path]) == root
+        except ValueError:  # different drives (Windows)
+            inside = False
+        if inside:
+            cf.filepath = cf.filepath
 
 
 def _poll():
@@ -774,7 +903,13 @@ class OPENBILLOW_OT_free(_DomainOp):
         return {"FINISHED"}
 
 
-_SND_COLORS = {"spray": (0.9, 0.95, 1.0, 0.6), "foam": (0.95, 0.97, 1.0, 0.9), "bubble": (0.7, 0.85, 1.0, 0.3)}
+# Render defaults per kind (look picked by A/B on Sparkling Water, 2026-11-20):
+# clear bubbles, opaque white foam, water-like spray.
+_SND_LOOK = {
+    "spray": {"Base Color": (0.95, 0.97, 1.0, 1.0), "Roughness": 0.0, "Transmission Weight": 1.0, "IOR": 1.33},
+    "foam": {"Base Color": (1.0, 1.0, 1.0, 1.0), "Roughness": 0.5, "Transmission Weight": 0.0, "IOR": 1.45},
+    "bubble": {"Base Color": (1.0, 1.0, 1.0, 1.0), "Roughness": 0.0, "Transmission Weight": 1.0, "IOR": 0.75},
+}
 
 
 def _snd_material(kind):
@@ -785,11 +920,115 @@ def _snd_material(kind):
         m.use_nodes = True
         bsdf = m.node_tree.nodes.get("Principled BSDF")
         if bsdf:
-            r, g, b, a = _SND_COLORS[kind]
-            bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
-            bsdf.inputs["Roughness"].default_value = 0.2
-            bsdf.inputs["Alpha"].default_value = a
+            for k, v in _SND_LOOK[kind].items():
+                if k in bsdf.inputs:
+                    bsdf.inputs[k].default_value = v
     return m
+
+
+# Per-kind thinning and size spread (picked by A/B on Foam, 2026-11-20). Keep: share
+# of points rendered (dense sub-pixel points otherwise blur into a smoke-like haze).
+# Max Size: bubble radius spread up to this many times the baked radius, power law
+# N(>r) ~ 1/r^2 (many small, few large: small bubbles merge into rare big ones).
+# Foam and spray stay at the baked size (fine droplets).
+_SND_SHAPE = {
+    "spray": {"Keep": 0.125, "Max Size": 1.0},
+    "foam": {"Keep": 0.125, "Max Size": 1.0},
+    "bubble": {"Keep": 0.125, "Max Size": 16.0},
+}
+
+_SND_GROUP = "OpenBillow Particles v2"
+
+
+def _snd_node_group():
+    """GN group run after the Mesh Sequence Cache: thins the points, spreads and
+    scales the radius, then sets the material on the evaluated points (data
+    materials do not survive the cache evaluation, and the cloud then renders
+    empty in Cycles). Set Material must stay last: Delete Geometry drops it."""
+    ng = bpy.data.node_groups.get(_SND_GROUP)
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(_SND_GROUP, "GeometryNodeTree")
+    it = ng.interface
+    it.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    sc = it.new_socket("Radius Scale", in_out="INPUT", socket_type="NodeSocketFloat")
+    sc.default_value, sc.min_value = 1.0, 0.0
+    it.new_socket("Material", in_out="INPUT", socket_type="NodeSocketMaterial")
+    kp = it.new_socket("Keep", in_out="INPUT", socket_type="NodeSocketFloat")
+    kp.default_value, kp.min_value, kp.max_value, kp.subtype = 1.0, 0.0, 1.0, "FACTOR"
+    mx = it.new_socket("Max Size", in_out="INPUT", socket_type="NodeSocketFloat")
+    mx.default_value, mx.min_value = 1.0, 1.0
+    sd = it.new_socket("Seed", in_out="INPUT", socket_type="NodeSocketInt")
+    sd.default_value = 0
+    it.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    n, l = ng.nodes, ng.links
+    gi = n.new("NodeGroupInput")
+    go = n.new("NodeGroupOutput")
+    # thin: delete points whose random draw is above Keep
+    rk = n.new("FunctionNodeRandomValue")
+    rk.data_type = "BOOLEAN"
+    nt = n.new("FunctionNodeBooleanMath")
+    nt.operation = "NOT"
+    dl = n.new("GeometryNodeDeleteGeometry")
+    dl.domain = "POINT"
+    l.new(gi.outputs["Keep"], rk.inputs["Probability"])
+    l.new(gi.outputs["Seed"], rk.inputs["Seed"])
+    l.new(rk.outputs[0], nt.inputs[0])
+    l.new(gi.outputs["Geometry"], dl.inputs["Geometry"])
+    l.new(nt.outputs[0], dl.inputs["Selection"])
+    # radius * scale * min((1-u)^-0.5, Max Size)
+    ru = n.new("FunctionNodeRandomValue")
+    ru.data_type = "FLOAT"
+    sdo = n.new("ShaderNodeMath")
+    sdo.operation = "ADD"
+    sdo.inputs[1].default_value = 7.0
+    l.new(gi.outputs["Seed"], sdo.inputs[0])
+    l.new(sdo.outputs[0], ru.inputs["Seed"])
+    sb = n.new("ShaderNodeMath")
+    sb.operation = "SUBTRACT"
+    sb.inputs[0].default_value = 1.0
+    pw = n.new("ShaderNodeMath")
+    pw.operation = "POWER"
+    pw.inputs[1].default_value = -0.5
+    mn = n.new("ShaderNodeMath")
+    mn.operation = "MINIMUM"
+    rad = n.new("GeometryNodeInputRadius")
+    m1 = n.new("ShaderNodeMath")
+    m1.operation = "MULTIPLY"
+    m2 = n.new("ShaderNodeMath")
+    m2.operation = "MULTIPLY"
+    spr = n.new("GeometryNodeSetPointRadius")
+    smat = n.new("GeometryNodeSetMaterial")
+    l.new(ru.outputs[0], sb.inputs[1])
+    l.new(sb.outputs[0], pw.inputs[0])
+    l.new(pw.outputs[0], mn.inputs[0])
+    l.new(gi.outputs["Max Size"], mn.inputs[1])
+    l.new(rad.outputs[0], m1.inputs[0])
+    l.new(gi.outputs["Radius Scale"], m1.inputs[1])
+    l.new(m1.outputs[0], m2.inputs[0])
+    l.new(mn.outputs[0], m2.inputs[1])
+    l.new(dl.outputs[0], spr.inputs["Points"])
+    l.new(m2.outputs[0], spr.inputs["Radius"])
+    l.new(spr.outputs[0], smat.inputs["Geometry"])
+    l.new(gi.outputs["Material"], smat.inputs["Material"])
+    l.new(smat.outputs[0], go.inputs[0])
+    for i, nd in enumerate((gi, rk, nt, dl, ru, sdo, sb, pw, mn, rad, m1, m2, spr, smat, go)):
+        nd.location = (180 * i, 0)
+    return ng
+
+
+def _snd_add_modifier(o, mat, kind=None):
+    mod = o.modifiers.get("OpenBillow Look") or o.modifiers.new("OpenBillow Look", "NODES")
+    mod.node_group = _snd_node_group()
+    values = {"Material": mat, **_SND_SHAPE.get(kind, {})}
+    props = getattr(mod, "properties", None)  # Blender 5.2+: typed inputs
+    for item in mod.node_group.interface.items_tree:
+        if getattr(item, "in_out", None) == "INPUT" and item.name in values:
+            if props is not None and hasattr(props, "inputs"):
+                getattr(props.inputs, item.identifier).value = values[item.name]
+            else:
+                mod[item.identifier] = values[item.name]
+    return mod
 
 
 def _snd_name(ob, kind):
@@ -830,12 +1069,14 @@ class OPENBILLOW_OT_import_particles(_DomainOp):
             return {"CANCELLED"}
         for o in set(bpy.data.objects) - before:
             kind = o.name.split(".")[0].lower()
-            if kind not in _SND_COLORS:
+            if kind not in _SND_LOOK:
                 continue
             o.name = _snd_name(dom, kind)
-            if o.data is not None:
+            mat = _snd_material(kind)
+            if o.data is not None and hasattr(o.data, "materials"):
                 o.data.materials.clear()
-                o.data.materials.append(_snd_material(kind))
+                o.data.materials.append(mat)
+            _snd_add_modifier(o, mat, kind)
             for c in list(o.users_collection):
                 c.objects.unlink(o)
             for c in dom.users_collection or [context.scene.collection]:
@@ -878,7 +1119,18 @@ class OPENBILLOW_OT_set_role(Operator):
         return {"FINISHED"}
 
 
-_classes = (OPENBILLOW_OT_bake, OPENBILLOW_OT_resume, OPENBILLOW_OT_cancel, OPENBILLOW_OT_free,
+class OPENBILLOW_OT_reset_look(Operator):
+    bl_idname = "openbillow.reset_look"
+    bl_label = "Reset Look"
+    bl_description = "Rebuild the generated smoke/fire material with its default look (no re-bake needed)"
+    bl_options = {"UNDO"}
+
+    def execute(self, context):
+        reset_look(context.object)
+        return {"FINISHED"}
+
+
+_classes = (OPENBILLOW_OT_reset_look, OPENBILLOW_OT_bake, OPENBILLOW_OT_resume, OPENBILLOW_OT_cancel, OPENBILLOW_OT_free,
             OPENBILLOW_OT_detect_gpu, OPENBILLOW_OT_set_role, OPENBILLOW_OT_import_particles)
 
 

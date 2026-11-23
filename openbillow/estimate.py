@@ -26,8 +26,9 @@ PER_CELL_COMBUSTION = 4  # COMBUSTION: the expansion (divergence) grid
 # weighted pressure matrix. Measured +40.0 B/cell at 128 and 256 (plume BOTH, tests/measure_vram.py --fire-model).
 PER_CELL_FLAME_FRONT = 40
 # DIFFUSION on top of COMBUSTION (CODE-GAS-037): lift, face weights (MAC) and the weighted pressure matrix as
-# FLAME_FRONT (28), plus sig, k_sgs, the source rate and 3 vec3 transport buffers (48). Not yet measured.
-PER_CELL_MIXTURE_FRACTION = 76
+# FLAME_FRONT (28), plus sig, k_sgs, the source rate, 3 vec3 transport buffers and the vec3 outflow limiter
+# (60, CODE-GAS-046). Not yet measured.
+PER_CELL_MIXTURE_FRACTION = 88
 # FLAME_FRONT / DIFFUSION viscosity (CODE-GAS-029): the nu grid and the diffusion CG work grids (4 vec3).
 PER_CELL_GAS_VISCOSITY = 4 + 48
 PER_CELL_HIGH_QUALITY = 12  # quality HIGH (advection-reflection): the unprojected velocity (MAC)
@@ -72,7 +73,7 @@ PER_CELL_WALL_CONTACT = 20
 # Secondary particles: phi_tmp + vel_tmp per simulation cell; flags, 4 potential/ratio grids,
 # phi, phi_obs, vel per particle-grid cell (x scale^3, plus phi_out); 32 B per particle
 # (pos, vel, flag, life) with growth headroom. The count is a rough budget (dam at f60: 16/cell at
-# particle_scale 1, 8x that x SND_SCALE_BOOST at scale 2, about 5x with MULTIPLE sampling;
+# particle_scale 1, 8x that x SND_SCALE_BOOST at scale 2, about 6.4x with MULTIPLE sampling (stochastic rounding, 2026-11-22);
 # tests/test_estimate_live.py, 60 frames at 64^3, 2026-11-09). A finer particle grid seeds more than
 # scale^3 (live particles per cell at f60: 7.6 at scale 1, 88.5 at scale 2), and the peak is at a
 # capacity growth, when the old and the new arrays are both allocated.
@@ -90,7 +91,7 @@ PER_CELL_FORCES = 12      # the force-field grid (one vec3)
 # Guiding (counted): PD scratch 9 MAC + invA (112), velT, weight, guidevel, guide cell
 # velocity, guide phi and count (48), extrapolation marks (4).
 PER_CELL_GUIDING = 164
-PER_CELL_INVEL = 12       # liquid: the initial-velocity grid (one vec3) when a flow sets an initial velocity
+PER_CELL_INVEL = 12       # the initial-velocity grid (one vec3) when a flow sets an initial velocity (liquid and gas)
 PER_CELL_FLOW_PHI = 4     # liquid: each extra flow level set (static inflow, static outflow, moving outflow)
 PER_CELL_GUIDE_VEL = 12   # the guide velocity grid, which has the parent domain's resolution
 # System RAM for output, measured on a fully active 256-cubed grid (peak RSS during write_vdb)
@@ -162,7 +163,7 @@ def estimate_bytes(size, resolution_max, has_obstacles=False, moving_obstacles=F
     of it; gas_viscosity=True with either: its viscosity solve.
     high_quality=True: gas quality HIGH (ignored for liquid). aniso_mesh=True: liquid meshed
     with the High Quality (anisotropic) generator. wall_contact=True: mesh_wall_contact on (Final or
-    High Quality). initial_velocity=True: a liquid flow has an initial
+    High Quality). initial_velocity=True: a flow has an initial
     velocity; flow_levelsets (0-3): the extra liquid flow level sets; guide_cells: cell count of the parent's
     guide grid for a domain-guided bake (0: assume the same as this domain).
     """
@@ -183,7 +184,7 @@ def estimate_bytes(size, resolution_max, has_obstacles=False, moving_obstacles=F
                         + (PER_CELL_ANISO_MESH if aniso_mesh else 0)
                         + (PER_CELL_WALL_CONTACT if wall_contact else 0)
                         + ((PER_CELL_SND + PER_SND_GRID_CELL * max(1, int(particle_scale)) ** 3
-                            + SND_PARTICLES_PER_CELL * (5 if snd_multiple else 1) * max(1, int(particle_scale)) ** 3
+                            + SND_PARTICLES_PER_CELL * (6.4 if snd_multiple else 1) * max(1, int(particle_scale)) ** 3
                             * (SND_SCALE_BOOST if int(particle_scale) > 1 else 1)
                             * PER_SND_PARTICLE) if secondary else 0)) + guide_extra)
     per = PER_CELL + (PER_CELL_OBSTACLE if has_obstacles or moving_obstacles else 0)
@@ -192,7 +193,8 @@ def estimate_bytes(size, resolution_max, has_obstacles=False, moving_obstacles=F
                  + (PER_CELL_FLAME_FRONT if fire and flame_front else 0)
                  + (PER_CELL_MIXTURE_FRACTION if fire and mixture_fraction else 0)
                  + (PER_CELL_GAS_VISCOSITY if fire and (flame_front or mixture_fraction) and gas_viscosity else 0) + (PER_CELL_FORCES if force_fields else 0)
-                 + (PER_CELL_GUIDING if guiding else 0) + (PER_CELL_HIGH_QUALITY if high_quality else 0))
+                 + (PER_CELL_GUIDING if guiding else 0) + (PER_CELL_HIGH_QUALITY if high_quality else 0)
+                 + (PER_CELL_INVEL if initial_velocity else 0))
     if noise_upres:
         total += (NOISE_TILE_BYTES + n * PER_CELL_NOISE_LOW
                   + n * noise_upres ** 3 * (PER_CELL_NOISE + (PER_CELL_NOISE_FIRE if fire else 0)))

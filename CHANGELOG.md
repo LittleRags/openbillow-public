@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.1 Early Access (2026-11-23)
+
+- Keyframes (or drivers) on a flow's strength are now followed: gas flows key Density, Temperature,
+  Flame Rate and Initial Velocity (Source, Normal, Initial X/Y/Z); liquid inflows key Initial Velocity,
+  so a jet can ramp up, fade or pulse. Older bakes read as constant.
+- Liquid secondary particles (spray, foam, bubbles): the emitted count no longer drops to zero at
+  small timesteps or slow motion. Scenes with these particles get more of them than before;
+  Sparkling Water-style presets may need their Trapped Air Sampling lowered.
+- The VRAM estimate allows for the larger Multiple-sampling particle buffers.
+- Command line: `--device managed` runs a bake in managed GPU memory (a bake that runs out of
+  VRAM on a farm worker now reruns once that way and resumes).
+
+- Imported particles (and any USD/Alembic cache in the bake folder) now reload when a bake
+  finishes. Before, a scene opened before its first bake kept empty spray, foam and bubbles
+  until the file was reopened.
+- Import Particles: spray, foam and bubbles now show up in Cycles renders. The imported point
+  clouds used to render empty because their material was lost when the cache was read; each
+  one now gets an "OpenBillow Look" modifier that sets the material and has a Radius Scale.
+  New default looks: clear bubbles, opaque white foam, water-like spray.
+- Smoke and fire flows now honour Initial Velocity (Source, Normal and Initial X/Y/Z), as in
+  Blender: the flow pushes the gas out at that speed. The Flow panel shows the settings for
+  gas domains too. Presets that already set an initial velocity (Heavy Smoke, Explosion) now
+  use it.
+- Liquid with the APIC method keeps its motion below the surface. APIC used to wipe the
+  velocity deeper than the particle band every step, so swirls and sloshing died away. FLIP
+  is unchanged.
+- New liquid mesh setting Final Smoothing: smooths the finished surface, removing the small
+  pits and ripples (orange peel) that the other smoothing settings cannot reach. 0 (the
+  default) keeps the old look.
+- New liquid viscosity setting Calm Walls: thick liquid (honey, syrup) resting in a jar or
+  glass no longer creeps up the walls. Off (the default) keeps the old result.
+
 ## 0.6.0 Early Access (2026-11-14)
 
 - Presets come as Scene Packs (gas, fire, liquid). Download / Update Presets fetches the

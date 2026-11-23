@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Command line: `openbillow_bake.py bake <folder> [--resume] [--frame-end N]
-[--device cuda:0] [--checkpoint-every 10] [--keep-checkpoints 1] [--break-lock]`;
+[--device auto|managed|cpu|cuda:0] [--checkpoint-every 10] [--keep-checkpoints 1] [--break-lock]`;
 other sub-commands: `estimate`, `devices`, `diagnostics`.
 
 Bake folder layout: bake.json + objects.npz in,
@@ -336,6 +336,10 @@ class Bake:
                 if f > sol.frame:  # stale frames after the resume point
                     _remove_retry(p)
 
+        # Test hook "N[,mode...]": the bake "runs out of VRAM" after frame N when its device mode
+        # is listed (default gpu). For tests/test_flamenco_task.py only.
+        hook = (os.environ.get("OPENBILLOW_TEST_OOM_FRAME") or "0").split(",")
+        oom_at = int(hook[0]) if mode in (hook[1:] or ["gpu"]) else 0
         times = []
         visc_warned = False
         first_frame = sol.frame
@@ -352,20 +356,31 @@ class Bake:
             path = os.path.join(self.vdb_dir, f"openbillow_{st.frame:04d}.vdb")
             tmp = os.path.join(self.vdb_dir, f".openbillow_{st.frame:04d}.vdb.tmp")
             tmp_usd = os.path.join(self.vdb_dir, f".particles_snd_{st.frame:04d}.usdc")
+            stage = {}  # seconds per output stage, logged with the frame (CODE-LIQ-019)
+            t_out = time.perf_counter()
             try:
                 if liquid:
+                    def surface():
+                        t = time.perf_counter()
+                        out = sol.surface()
+                        stage["surface"] = time.perf_counter() - t
+                        return out
                     write_liquid_vdb(tmp, lambda: b.to_numpy(sol.phi), lambda: b.to_numpy(sol.vel),
                                      settings.min_corner, sol.dx, band=sol.NARROW_BAND,
-                                     surface=sol.surface, mesh_scale=sol.mesh_scale,
+                                     surface=surface, mesh_scale=sol.mesh_scale,
                                      wall_layers=sol.mesh_wall_layers, vel_scale=sol.vel_scale)
+                    stage["vdb"] = time.perf_counter() - t_out - stage.get("surface", 0.0)
                     if settings.output_particles:
+                        t = time.perf_counter()
                         ply = os.path.join(self.vdb_dir, f"particles_{st.frame:04d}.ply")
                         _replace_write(ply, lambda fh: write_ply(fh, *sol.particles_world()))
+                        stage["ply"] = time.perf_counter() - t
                 else:
                     write_vdb(tmp, lambda: sol.output(sol.density), sol.output_temperature,
                               lambda: sol.output(sol.vel), sol.output_min_corner, sol.dx,
                               flame=(lambda: sol.output(sol.flame)) if sol.fire else None,
                               vel_scale=sol.vel_scale,
+                              extra={"fuel": lambda: sol.output(sol.fuel)} if sol.diffusion else None,
                               noise=(lambda: b.to_numpy(sol.noise.density),
                                      (lambda: b.to_numpy(sol.noise.flame)) if sol.fire else None,
                                      sol.noise.upres) if sol.noise else None)
@@ -383,7 +398,13 @@ class Bake:
                 _remove(tmp_usd)
                 raise
             if (st.frame - f0 + 1) % max(1, args.checkpoint_every) == 0 and st.frame < f1:
+                t = time.perf_counter()
                 self.checkpoint(sol, hasher)
+                stage["checkpoint"] = time.perf_counter() - t
+            t_out = time.perf_counter() - t_out
+            if oom_at and st.frame >= oom_at:
+                from .backend import BackendOutOfMemory
+                raise BackendOutOfMemory(f"OPENBILLOW_TEST_OOM_FRAME={oom_at}: fake out of VRAM")
             times = (times + [st.seconds])[-10:]
             spf = sum(times) / len(times)
             mem = b.memory()
@@ -398,7 +419,8 @@ class Bake:
                 + (f"{st.particles} particles, " if liquid else "")
                 + (f"viscosity iters {st.viscosity_iters} (residual {st.viscosity_residual:.2e}), "
                    if liquid and st.viscosity_iters else "")
-                + f"{st.seconds:.2f} s")
+                + f"{st.seconds:.2f} s, output {t_out:.2f} s"
+                + (" (" + ", ".join(f"{k} {v:.2f}" for k, v in stage.items()) + ")" if stage else ""))
             if liquid and st.viscosity_capped and not visc_warned:
                 visc_warned = True
                 log(f"warning: the viscosity solve stopped at its iteration limit on frame {st.frame} without "
@@ -468,11 +490,15 @@ def _pick_backend(device, need, log, managed=False, host=0):
     else the GPU with managed memory paging through system RAM, else the CPU (slower, uses
     system RAM). When nothing fits it returns the option with the most room, so the caller's
     over-limit check names the largest resolution. `auto:cuda:1` picks the GPU to try. Any
-    other value is passed to the backend as is. `managed` forces managed memory (tests).
+    other value is passed to the backend as is. `managed` (or `managed:cuda:1`) forces CUDA
+    managed memory: grids may exceed VRAM and page through system RAM (about 2x slower);
+    the farm task reruns an out-of-VRAM bake this way. `managed=True` is the old test flag.
     `host`: system RAM frame output needs (estimate.host_bytes)."""
     from . import estimate
     from .backend import get_backend
     device = device or "auto"
+    if device.startswith("managed"):
+        device, managed = "auto" + device[7:], True
     if not device.startswith("auto"):
         return get_backend(BACKEND, device, managed=managed)
     gpu = device[5:] or "cuda"
@@ -646,7 +672,8 @@ def main(argv=None):
     b.add_argument("folder")
     b.add_argument("--resume", action="store_true", help="continue from the newest checkpoint")
     b.add_argument("--frame-end", type=int, help="override frame_end from bake.json")
-    b.add_argument("--device", help="auto (default: GPU, or the CPU when the bake does not fit), auto:cuda:1, cpu, or cuda:0")
+    b.add_argument("--device", help="auto (default: GPU, managed memory or the CPU, whichever fits), auto:cuda:1, "
+                   "managed (GPU paging through system RAM, about 2x slower), managed:cuda:1, cpu, or cuda:0")
     b.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)  # force managed memory (tests)
     b.add_argument("--checkpoint-every", type=int, default=10, metavar="N")
     b.add_argument("--keep-checkpoints", type=int, default=1, metavar="N")

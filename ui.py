@@ -253,6 +253,8 @@ class OPENBILLOW_PT_domain_liquid(_Panel):
         if d.use_diffusion:
             col.prop(d, "viscosity_base")
             col.prop(d, "viscosity_exponent")
+        if d.use_viscosity or d.use_diffusion:
+            col.prop(d, "viscosity_first")
         row = col.row()
         row.active = d.quality == "HIGH"
         row.prop(d, "surface_tension")
@@ -272,6 +274,7 @@ class OPENBILLOW_PT_domain_liquid(_Panel):
         if d.mesh_generator == "IMPROVED":
             for p in ("mesh_concave_upper", "mesh_concave_lower"):
                 col.prop(d, p)
+        col.prop(d, "mesh_smoothen_final")
         if d.mesh_generator != "UNION":
             col.prop(d, "mesh_wall_contact")
 
@@ -346,10 +349,57 @@ class OPENBILLOW_PT_domain_fire(_GasPanel):
             box = lay.box()
             box.label(text="Diffusion Flame (experimental)", icon="EXPERIMENTAL")
             col = box.column()
+            col.prop(d, "diffusion_look")
             for p in ("diffusion_hrrpua", "diffusion_heat_of_combustion", "diffusion_air_fuel_ratio",
                       "diffusion_radiative_fraction", "diffusion_soot_yield",
                       "flame_kelvin", "ambient_kelvin", "use_air_viscosity"):
                 col.prop(d, p)
+
+
+# (node name, input, label) for the generated volume material (ops._material)
+LOOK_NODES = (("Smoke shader", "Color", "Smoke Colour"),
+              ("Smoke density", 1, "Smoke Density"),
+              ("Emission scale", None, "Flame Brightness"),
+              ("Flame shader", "Emission Color", "Flame Tint"),
+              ("Flame colour temperature", 1, "Flame Colour (temperature x)"),
+              ("Flame temperature range", "To Min", "Flame Min Temperature (K)"),
+              ("Flame temperature range", "To Max", "Flame Max Temperature (K)"),
+              ("Wick tip height", None, "Wick Tip Height (world Z, m)"),
+              ("Soot strength", 1, "Soot Brightness"),
+              ("Blue strength", 1, "Blue Base Brightness"))
+
+
+class OPENBILLOW_PT_domain_look(_GasPanel):
+    bl_label = "Render Look"
+    bl_parent_id = "OPENBILLOW_PT_domain"
+    role = "DOMAIN"
+
+    @classmethod
+    def poll(cls, context):
+        return super().poll(context) and ops.volume_object(context.object) is not None
+
+    def draw(self, context):
+        ob = context.object
+        lay = self.layout
+        lay.use_property_split = True
+        vo = ops.volume_object(ob)
+        mats = vo.data.materials
+        m = mats[0] if len(mats) else None
+        if ob.openbillow.domain.material or m is None or not m.get("openbillow_generated") or not m.node_tree:
+            lay.label(text="Look is controlled by the volume's material%s." % (" (%s)" % m.name if m else ""),
+                      icon="INFO")
+            return
+        lay.label(text="Shader-side: changes need no re-bake.")
+        col = lay.column()
+        for node, inp, label in LOOK_NODES:
+            n = m.node_tree.nodes.get(node)
+            if n is None:
+                continue
+            sock = n.outputs[0] if inp is None else n.inputs.get(inp) if isinstance(inp, str) else n.inputs[inp]
+            if sock is None or (inp is not None and sock.is_linked):
+                continue
+            col.prop(sock, "default_value", text=label)
+        lay.operator("openbillow.reset_look", icon="LOOP_BACK")
 
 
 class OPENBILLOW_PT_domain_noise(_GasPanel):
@@ -443,6 +493,17 @@ class OPENBILLOW_PT_flow(_Panel):
             lay.prop(f, "fuel_amount")
         for p in ("density", "temperature", "surface_distance", "volume_density", "use_plane_init"):
             lay.prop(f, p)
+        if f.flow_type != "SMOKE":  # CODE-ADD-034
+            lay.prop(f, "use_wick")
+            if f.use_wick:
+                col = lay.column()
+                for p in ("wick_diameter", "wick_length", "wick_burning", "wick_curl", "wick_square", "use_wick_rate"):
+                    col.prop(f, p)
+        lay.prop(f, "use_initial_velocity")
+        if f.use_initial_velocity:
+            col = lay.column()
+            for p in ("velocity_factor", "velocity_normal", "velocity_coord"):
+                col.prop(f, p)
         lay.prop(f, "use_emit_range")
         if f.use_emit_range:
             col = lay.column(align=True)
@@ -480,7 +541,7 @@ class OPENBILLOW_PT_guide(_Panel):
 
 
 _classes = (OPENBILLOW_PT_main, OPENBILLOW_PT_domain, OPENBILLOW_PT_domain_physics, OPENBILLOW_PT_domain_weights,
-            OPENBILLOW_PT_domain_liquid, OPENBILLOW_PT_domain_secondary, OPENBILLOW_PT_domain_fire, OPENBILLOW_PT_domain_noise,
+            OPENBILLOW_PT_domain_liquid, OPENBILLOW_PT_domain_secondary, OPENBILLOW_PT_domain_fire, OPENBILLOW_PT_domain_look, OPENBILLOW_PT_domain_noise,
             OPENBILLOW_PT_domain_guides, OPENBILLOW_PT_domain_borders, OPENBILLOW_PT_flow, OPENBILLOW_PT_obstacle,
             OPENBILLOW_PT_guide)
 

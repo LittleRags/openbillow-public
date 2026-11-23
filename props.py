@@ -104,9 +104,10 @@ class OpenBillowDomain(PropertyGroup):
     fractions_distance: FloatProperty(name="Obstacle Distance", default=0.5, min=-5.0, max=5.0,
                                       description="How far, in grid cells, liquid is kept away from obstacles when Fractions is on.")
     diffusion_hrrpua: FloatProperty(name="Heat Release Rate", default=1950.0, min=0.0, soft_max=3000.0,
-                                    description="Heat released per square metre of emitter footprint (its outline seen from "
-                                                "above), in kW/m2. The default is the 1 m propane pool fire of the FDS pool3d case; "
-                                                "total heat = this x footprint area")
+                                    description="Heat released per square metre of the emitter mesh's surface, in kW/m2; "
+                                                "total heat = this x the flow meshes' surface area. For a pool fire use a plane "
+                                                "(a box also burns on its sides and bottom). The default is the 1 m propane pool "
+                                                "fire of the FDS pool3d case")
     diffusion_heat_of_combustion: FloatProperty(name="Heat of Combustion", default=46.007, min=0.1, soft_max=100.0,
                                                 description="Energy released per kg of fuel burned, in MJ/kg. Propane is 46")
     diffusion_air_fuel_ratio: FloatProperty(name="Air/Fuel Ratio", default=15.592, min=0.1, soft_max=40.0,
@@ -122,6 +123,9 @@ class OpenBillowDomain(PropertyGroup):
                                 description="Makes the liquid thick and slow, like honey or lava. Takes longer to bake.")
     viscosity_value: FloatProperty(name="Strength", default=0.05, min=0.0, max=10.0, precision=4,
                                    description="How thick the liquid is. Higher is thicker, like honey instead of water.")
+    viscosity_first: BoolProperty(name="Calm Walls", default=False,
+                                  description="Thickens the liquid before gravity pulls on it, so thick liquid resting in a "
+                                              "container no longer creeps up the walls. Off matches Blender.")
     use_diffusion: BoolProperty(name="Diffusion", default=False,
                                 description="Sets the thickness with real-world numbers (Base and Exponent) instead of the simple Strength slider.")
     viscosity_base: FloatProperty(name="Base", default=1.0, min=0.0, max=10.0,
@@ -200,6 +204,10 @@ class OpenBillowDomain(PropertyGroup):
                                    description="How many times to smooth bumps that stick out of the surface.")
     mesh_smoothen_neg: IntProperty(name="Smoothing Negative", default=1, min=0, max=100,
                                    description="How many times to smooth dents that go into the surface.")
+    mesh_smoothen_final: IntProperty(name="Final Smoothing", default=0, min=0, max=100,
+                                     description="How many times to smooth the finished surface. Removes the small ripples "
+                                                 "and pits that real liquids lose to surface tension; the surface rises slightly "
+                                                 "(about one mesh cell at 30). 0 is off. Not in Blender.")
     mesh_concave_upper: FloatProperty(name="Concavity Upper", default=3.5, min=0.0, max=10.0,
                                       description="How strongly sharp inward corners in the surface are rounded off (upper limit).")
     mesh_concave_lower: FloatProperty(name="Concavity Lower", default=0.4, min=0.0, max=10.0,
@@ -251,6 +259,11 @@ class OpenBillowDomain(PropertyGroup):
                                  "step takes about 1.7x as long and needs a little more memory. Liquid: "
                                  "the pressure solve sees the exact surface position (smoother waves), and thick "
                                  "liquids can fold and coil but bake slower")])
+    diffusion_look: EnumProperty(name="Flame Look", default="FIRE", items=[
+        ("FIRE", "Fire", "Glow by temperature: for pool fires and torches"),
+        ("CANDLE", "Candle", "Light only from soot, a blue base and a dark gap at the wick. The wick tip "
+                             "height comes from a Candle Wick flow (else set it in Render Look). Needs a bake "
+                             "made with this version")])
     fire_model: EnumProperty(name="Fire Model", default="MANTAFLOW", items=[
         ("MANTAFLOW", "Blender", "Matches Blender's own fire. Soft, blobby flames."),
         ("COMBUSTION", "Combustion", "Fuel burns only when hot enough, gives off heat, cools down and expands. Gives tongues and sharper flame tips."),
@@ -352,13 +365,13 @@ class OpenBillowFlow(PropertyGroup):
     liquid_surface_distance: FloatProperty(name="Surface Emission", default=0.0, min=0.0, max=10.0,
                                            description="How far from the surface, in cells, liquid is made. 0 is right at the surface.")
     use_initial_velocity: BoolProperty(name="Initial Velocity", default=False,
-                                       description="Give the new liquid a starting speed and direction.")
+                                       description="Give the new liquid, smoke or fire a starting speed and direction.")
     velocity_factor: FloatProperty(name="Source", default=1.0, min=0.0, max=100.0,
-                                   description="How much of the object's own movement the new liquid picks up. 1 is all of it.")
+                                   description="How much of the object's own movement the new liquid or smoke picks up. 1 is all of it.")
     velocity_normal: FloatProperty(name="Normal", default=0.0, min=-100.0, max=100.0,
-                                   description="Speed at which the liquid is pushed straight out of the object's surface.")
+                                   description="Speed at which the liquid or smoke is pushed straight out of the object's surface.")
     velocity_coord: FloatVectorProperty(name="Initial", default=(0.0, 0.0, 0.0), subtype="VELOCITY",
-                                        description="Starting speed and direction of the new liquid, in metres per second.")
+                                        description="Starting speed and direction of the new liquid or smoke, in metres per second.")
     flow_type: EnumProperty(name="Flow Type", default="SMOKE", items=[
         ("SMOKE", "Smoke", "Smoke only."), ("FIRE", "Fire", "Fire only."), ("BOTH", "Fire + Smoke", "Fire and smoke.")], description="What this object produces.")
     fuel_amount: FloatProperty(name="Flame Rate", default=1.0, min=0.0, max=5.0,
@@ -377,6 +390,30 @@ class OpenBillowFlow(PropertyGroup):
                                   description="How much smoke is made inside the object, not only on its surface.")
     use_plane_init: BoolProperty(name="Is Planar", default=False,
                                  description="Tick for a flat object such as a plane, which has no inside, so it is treated as a surface only.")
+    # CODE-ADD-034: a candle wick built at bake time in place of this object's mesh
+    use_wick: BoolProperty(name="Candle Wick", default=False,
+                           description="Replace this object's shape with a candle wick standing up from its origin "
+                                       "(the top of the wax). The lower part is a cold solid, the rest gives off fuel. "
+                                       "For the Diffusion fire model.")
+    wick_diameter: FloatProperty(name="Wick Diameter", default=0.0012, min=0.0001, soft_max=0.01,
+                                 subtype="DISTANCE", unit="LENGTH", precision=4,
+                                 description="Thickness of the wick.")
+    wick_length: FloatProperty(name="Wick Length", default=0.003, min=0.0005, soft_max=0.03,
+                               subtype="DISTANCE", unit="LENGTH", precision=4,
+                               description="How far the wick stands above the wax. A longer wick gives a taller "
+                                           "flame; long wicks flicker.")
+    wick_burning: FloatProperty(name="Burning Length", default=0.0, min=0.0, soft_max=0.03,
+                                subtype="DISTANCE", unit="LENGTH", precision=4,
+                                description="How much of the top of the wick gives off fuel. 0 works it out from "
+                                            "the wick's size (Sunderland 2011).")
+    wick_curl: FloatProperty(name="Wick Curl", default=0.0, soft_min=-0.01, soft_max=0.01,
+                             subtype="DISTANCE", unit="LENGTH", precision=4,
+                             description="How far the tip bends off to the side, along the object's X axis.")
+    wick_square: BoolProperty(name="Square Wick", default=False,
+                              description="A square section instead of a round one.")
+    use_wick_rate: BoolProperty(name="Heat Release from Wick", default=True,
+                                description="Set the domain's Heat Release Rate from the wick's size, as a real "
+                                            "paraffin candle burns (Sunderland 2011). Untick to use the domain's value.")
 
 
 class OpenBillowObstacle(PropertyGroup):

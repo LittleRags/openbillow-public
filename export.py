@@ -15,7 +15,8 @@ import numpy as np
 from .openbillow.bakefile import STATIC_TOL, write_bake
 from .openbillow.forcefields import TYPES as FIELD_TYPES, EffectorWeights, ForceField
 from .openbillow.liquid import LiquidFlow, LiquidSettings
-from .openbillow.solver import DomainSettings, MeshFlow, MeshGuide, MeshObstacle
+from .openbillow.meshes import wick_hrrpua, wick_meshes
+from .openbillow.solver import ANIM_GAS, ANIM_LIQUID, _COORD, DomainSettings, MeshFlow, MeshGuide, MeshObstacle
 
 # MANTA_main.cpp: a side without border collision is open (outflow).
 _BORDERS = (("use_collision_border_left", "x"), ("use_collision_border_right", "X"),
@@ -154,6 +155,7 @@ def liquid_domain_kw(scene, ds) -> dict:
             "volume_correction_rate": ds.volume_correction_rate,
             "use_viscosity": ds.use_viscosity, "viscosity_value": ds.viscosity_value,
             "use_diffusion": ds.use_diffusion, "viscosity_base": ds.viscosity_base,
+            "viscosity_first": ds.viscosity_first,
             "viscosity_exponent": ds.viscosity_exponent, "surface_tension": ds.surface_tension,
             "use_fractions": ds.use_fractions,
             "fractions_threshold": ds.fractions_threshold, "fractions_distance": ds.fractions_distance,
@@ -168,7 +170,7 @@ def liquid_domain_kw(scene, ds) -> dict:
             **{k: getattr(ds, "sndparticle_" + v) for k, v in _SND.items()},
             **_multiple_rates(ds),
             **{k: getattr(ds, k) for k in ("mesh_generator", "mesh_scale", "mesh_particle_radius",
-                                           "mesh_smoothen_pos", "mesh_smoothen_neg",
+                                           "mesh_smoothen_pos", "mesh_smoothen_neg", "mesh_smoothen_final",
                                            "mesh_concave_upper", "mesh_concave_lower", "mesh_wall_contact")}}
 
 def liquid_flow_kw(fs) -> dict:
@@ -183,8 +185,31 @@ def flow_kw(fs) -> dict:
     return dict(density=fs.density, temperature=fs.temperature,
                 surface_distance=fs.surface_distance, volume_density=fs.volume_density,
                 plane_init=fs.use_plane_init, flow_type=fs.flow_type, fuel_amount=fs.fuel_amount,
+                use_initial_velocity=fs.use_initial_velocity, velocity_factor=fs.velocity_factor,
+                velocity_normal=fs.velocity_normal,
+                velocity_coord=tuple(float(x) for x in fs.velocity_coord),
                 emit_start=fs.emit_start if fs.use_emit_range else 0,
-                emit_end=fs.emit_end if fs.use_emit_range else 0)
+                emit_end=fs.emit_end if fs.use_emit_range else 0, **wick_kw(fs))
+
+def wick_kw(fs) -> dict:
+    """{"wick": ...} for a Candle Wick flow (CODE-ADD-034), else {}. `export_bake` pops it."""
+    if not getattr(fs, "use_wick", False) or fs.flow_type == "SMOKE":
+        return {}
+    r = lambda x: round(float(x), 7)  # noqa: E731  float32 -> the metre value typed (0.0012, not 0.00120000006)
+    return {"wick": dict(d=r(fs.wick_diameter), length=r(fs.wick_length), burning=r(fs.wick_burning) or None,
+                         curl=r(fs.wick_curl), square=bool(fs.wick_square), rate=bool(fs.use_wick_rate))}
+
+
+def _wick_rate(flows, fire_model):
+    """Diffusion heat release per m^2 from the Candle Wick flows that ask for it, or None."""
+    rates = {round(float(wick_hrrpua(w["d"], w["length"], w["burning"], w["square"])[0]), 6)
+             for w in (kw.get("wick") for _, kw in flows) if w and w["rate"]}
+    if fire_model != "DIFFUSION" or not rates:
+        return None
+    if len(rates) > 1:
+        raise ExportError("Candle wicks of different sizes need one Heat Release Rate: untick "
+                          "'Heat Release from Wick' and set it on the domain")
+    return rates.pop()
 
 def obstacle_kw(es) -> dict:
     return dict(surface_thickness=es.surface_distance, plane_init=es.use_plane_init)
@@ -225,6 +250,12 @@ def _domain_box(ob, depsgraph, flat_y=False):
     if (hi - lo <= 0)[[0, 2] if flat_y else [0, 1, 2]].any():
         raise ExportError(f"Domain '{ob.name}' is flat")
     return tuple(lo.tolist()), tuple((hi - lo).tolist())
+
+def _is_animated(ob) -> bool:
+    """True if the object has an action, drivers or NLA tracks that could change a flow property."""
+    ad = ob.animation_data
+    return bool(ad and (ad.action or ad.drivers or ad.nla_tracks))
+
 
 def may_move(ob) -> bool:
     """False only if the object's world matrix certainly cannot change over time.
@@ -278,10 +309,15 @@ def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: d
         meshes = [_mesh_arrays(ob, dg) for ob, _ in meshed]
         mats = np.empty((len(objs), len(times), 4, 4), np.float64)
         moving = [i for i, ob in enumerate(objs) if may_move(ob)]
+        # keyframed gas flow strength (CODE-ADD-036): sampled with the matrices
+        names = ANIM_LIQUID if liquid else ANIM_GAS
+        names = names + _COORD
+        keyed = [i for i in range(len(flows)) if _is_animated(objs[i])]
+        anim = {i: np.empty((len(times), len(names))) for i in keyed}
         for i, ob in enumerate(objs):
             if i not in moving:
                 mats[i] = np.array(ob.matrix_world, np.float64)
-        if moving:
+        if moving or keyed:
             wm = bpy.context.window_manager
             wm.progress_begin(0, len(times))
             try:
@@ -290,6 +326,10 @@ def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: d
                     scene.frame_set(f, subframe=float(t - f))
                     for i in moving:
                         mats[i, j] = np.array(objs[i].matrix_world, np.float64)
+                    for i in keyed:
+                        fl = objs[i].openbillow.flow
+                        anim[i][j] = [fl.velocity_coord[int(n[-1])] if n.startswith("velocity_coord_")
+                                      else getattr(fl, n) for n in names]
                     if j % 10 == 0:
                         wm.progress_update(j)
             finally:
@@ -297,17 +337,29 @@ def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: d
     finally:
         scene.frame_set(old_frame, subframe=old_sub)
 
-    made = []
+    made, wick_bases = [], []
     nf, no = len(flows), len(flows) + len(obstacles)
     for i, (ob, kw) in enumerate(meshed):
         cls = (LiquidFlow if liquid else MeshFlow) if i < nf else MeshObstacle if i < no else MeshGuide
         (v, t), m = meshes[i], mats[i]
+        kw = dict(kw)
+        wick = kw.pop("wick", None)
+        if wick:  # CODE-ADD-034: the wick replaces the mesh; the object's scale is ignored
+            base, (v, t) = wick_meshes(wick["d"], wick["length"], wick["burning"], wick["curl"], wick["square"])
+            m = m.copy()
+            m[:, :3, :3] /= np.linalg.norm(m[:, :3, :3], axis=1, keepdims=True)
         if len(t) == 0:
             raise ExportError(f"'{ob.name}' has no faces")
-        if np.ptp(m, axis=0).max() < STATIC_TOL:
-            made.append(cls(v, t, m[0], None, **kw))
-        else:
-            made.append(cls(v, t, m, times.copy(), **kw))
+        static = np.ptp(m, axis=0).max() < STATIC_TOL
+        if i in anim:  # only the properties that actually change
+            a = anim[i]
+            vary = {n: a[:, j].copy() for j, n in enumerate(names) if np.ptp(a[:, j]) > 1e-9}
+            if vary:
+                kw.update(anim=vary, anim_times=times.copy())
+        made.append(cls(v, t, m[0], None, **kw) if static else cls(v, t, m, times.copy(), **kw))
+        if wick and base is not None:  # the quenched lower wick is a solid
+            wick_bases.append((f"{ob.name} (wick base)", MeshObstacle(*base, m[0], None) if static
+                               else MeshObstacle(*base, m, times.copy())))
     nfo = len(meshed)
     made_fields = []
     for j, ob in enumerate(fields):
@@ -317,11 +369,14 @@ def export_bake(folder: str, scene, domain, flows, obstacles, domain_settings: d
             made_fields.append(ForceField(**kw, matrix=m[0]))
         else:
             made_fields.append(ForceField(**kw, matrix=m, frames=times.copy()))
+    rate = None if liquid else _wick_rate(flows, domain_settings.get("fire_model"))
+    if rate is not None:
+        domain_settings = dict(domain_settings, diffusion_hrrpua=rate)
     settings = (LiquidSettings if liquid else DomainSettings)(
         **domain_settings, min_corner=min_corner, size=size,
         domain_mat3=tuple(np.array(domain.matrix_world, np.float64)[:3, :3].ravel().tolist()), flows=made[:nf],
-        obstacles=made[nf:no], guides=made[no:],
+        obstacles=made[nf:no] + [o for _, o in wick_bases], guides=made[no:],
         force_fields=made_fields, effector_weights=weights or EffectorWeights())
     write_bake(folder, settings, fs, fe, [ob.name for ob, _ in flows],
-               [ob.name for ob, _ in obstacles], [ob.name for ob, _ in guides])
+               [ob.name for ob, _ in obstacles] + [n for n, _ in wick_bases], [ob.name for ob, _ in guides])
     return settings

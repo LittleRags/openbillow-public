@@ -3,7 +3,7 @@
 
 Ported from Mantaflow plugin/secondaryparticles.cpp
 (`flipComputeSecondaryParticlePotentials`, `flipSampleSecondaryParticles`
-mode 'single', `flipUpdateSecondaryParticles` mode 'linear',
+mode 'single' (optionally with stochastic instead of truncated counts), `flipUpdateSecondaryParticles` mode 'linear',
 `flipDeleteParticlesInObstacle`) and commonkernels.h `GradientOp`, with
 vectorbase.h `norm` / `getNormalized` (std::hypot as libstdc++'s float
 __hypot3). Mixed float/double expressions of the float build are kept: Mantaflow
@@ -208,10 +208,22 @@ def _sub_point(i: int, j: int, k: int, q: int):
                    float(k) + wp.where((q & 4) != 0, 0.75, 0.25))
 
 
+@wp.func
+def _round_count(x: float, stochastic: int, seed: int, i: int, j: int, k: int, q: int):
+    # Mantaflow truncates the expected count per cell per step, so the fraction is lost and
+    # the count depends on dt (small steps or slow motion give almost nothing). Stochastic
+    # rounding floor(x + u) keeps the expected count = x. The same (seed, cell, q) gives the
+    # same u in the count and the emit kernel.
+    if stochastic == 0:
+        return int(x)
+    st = wp.rand_init(seed + q * 7919, i + 4099 * (j + 4099 * k))
+    return wp.max(int(wp.floor(x + wp.randf(st))), 0)
+
+
 @wp.kernel
 def _sample_count_kernel(flags: wp.array3d(dtype=wp.int32), pot_ta: wp.array3d(dtype=wp.float32),
                          pot_wc: wp.array3d(dtype=wp.float32), pot_ke: wp.array3d(dtype=wp.float32),
-                         k_ta: float, k_wc: float, dt: float, mode: int,
+                         k_ta: float, k_wc: float, dt: float, mode: int, stochastic: int, seed: int,
                          count: wp.array3d(dtype=wp.int32), draws: wp.array3d(dtype=wp.int32)):
     # Particles per cell and random numbers it takes (single: 3 for the cell offset, 4 per
     # particle; multiple: 4 per particle), stored [k, j, i] so the flat scan runs in
@@ -220,12 +232,14 @@ def _sample_count_kernel(flags: wp.array3d(dtype=wp.int32), pot_ta: wp.array3d(d
     n = int(0)
     if (flags[i, j, k] & FLUID) != 0:
         if mode == 0:
-            n = int(pot_ke[i, j, k] * (k_ta * pot_ta[i, j, k] + k_wc * pot_wc[i, j, k]) * dt)
+            n = _round_count(pot_ke[i, j, k] * (k_ta * pot_ta[i, j, k] + k_wc * pot_wc[i, j, k]) * dt,
+                             stochastic, seed, i, j, k, 0)
         else:
             for q in range(8):
                 xp = _sub_point(i, j, k, q)
-                n += int(_interp_scalar(pot_ke, xp) * (k_ta * _interp_scalar(pot_ta, xp)
-                                                       + k_wc * _interp_scalar(pot_wc, xp)) * dt)
+                n += _round_count(_interp_scalar(pot_ke, xp) * (k_ta * _interp_scalar(pot_ta, xp)
+                                                                + k_wc * _interp_scalar(pot_wc, xp)) * dt,
+                                  stochastic, seed, i, j, k, q)
     count[k, j, i] = n
     draws[k, j, i] = wp.where(n != 0, wp.where(mode == 0, 3, 0) + 4 * n, 0)
 
@@ -267,7 +281,7 @@ def _sample_emit_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype
                         count: wp.array3d(dtype=wp.int32), slot: wp.array3d(dtype=wp.int32),
                         rstart: wp.array3d(dtype=wp.int32), rnd: wp.array(dtype=wp.float32),
                         base: int, dt: float, l_min: float, l_max: float, c_s: float, c_b: float,
-                        k_ta: float, k_wc: float, mode: int,
+                        k_ta: float, k_wc: float, mode: int, stochastic: int, seed: int,
                         pos: wp.array(dtype=wp.vec3), pvel: wp.array(dtype=wp.vec3),
                         life: wp.array(dtype=wp.float32), flag: wp.array(dtype=wp.int32)):
     # knFlipSampleSecondaryParticles (3D)
@@ -297,7 +311,7 @@ def _sample_emit_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array4d(dtype
         ke_p = _interp_scalar(pot_ke, xp)
         ta_p = _interp_scalar(pot_ta, xp)
         wc_p = _interp_scalar(pot_wc, xp)
-        np_ = int(ke_p * (k_ta * ta_p + k_wc * wc_p) * dt)
+        np_ = _round_count(ke_p * (k_ta * ta_p + k_wc * wc_p) * dt, stochastic, seed, i, j, k, sq)
         if np_ > 0:
             s = _emit_cylinder(vel, xp, np_, 0.25, dt, l_min, l_max,
                                (ke_p + ta_p + wc_p) / 3.0, typ, rnd, r, s, pos, pvel, life, flag)
@@ -430,17 +444,18 @@ class SecondaryMixin:
 
     def sample_secondary_particles(self, parts, flags, vel, pot_ta, pot_wc, pot_ke, neighbor_ratio,
                                    k_ta, k_wc, life_min, life_max, dt, c_s=0.4, c_b=0.77,
-                                   sampling="SINGLE"):
+                                   sampling="SINGLE", stochastic=False, seed=0):
         dev = self.device
         shape = tuple(flags.shape)
         f32 = lambda x: float(np.float32(x))  # noqa: E731
         mode = {"SINGLE": 0, "MULTIPLE": 1}[sampling]
+        rounding = [int(bool(stochastic)), int(seed) & 0x7fffffff]
         count = self._scratch_int(shape[::-1], "snd_count")
         draws = self._scratch_int(shape[::-1], "snd_draws")
         slot = self._scratch_int(shape[::-1], "snd_slot")
         rstart = self._scratch_int(shape[::-1], "snd_rstart")
         wp.launch(_sample_count_kernel, dim=shape,
-                  inputs=[flags, pot_ta, pot_wc, pot_ke, f32(k_ta), f32(k_wc), f32(dt), mode, count, draws],
+                  inputs=[flags, pot_ta, pot_wc, pot_ke, f32(k_ta), f32(k_wc), f32(dt), mode, *rounding, count, draws],
                   device=dev)
         total, n_rnd = self._scan_totals((count.reshape(-1), slot.reshape(-1)),
                                          (draws.reshape(-1), rstart.reshape(-1)))
@@ -452,7 +467,7 @@ class SecondaryMixin:
         wp.launch(_sample_emit_kernel, dim=shape,
                   inputs=[flags, f4(vel), pot_ta, pot_wc, pot_ke, neighbor_ratio, count, slot, rstart,
                           self._random_stream(n_rnd), parts.n, f32(dt), f32(life_min), f32(life_max),
-                          f32(c_s), f32(c_b), f32(k_ta), f32(k_wc), mode, parts.pos, parts.vel, parts.life,
+                          f32(c_s), f32(c_b), f32(k_ta), f32(k_wc), mode, *rounding, parts.pos, parts.vel, parts.life,
                           parts.flag], device=dev)
         parts.n += total
 

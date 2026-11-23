@@ -534,10 +534,17 @@ def _correct_vel_kernel(flags: wp.array3d(dtype=wp.int32), vel: wp.array3d(dtype
 
 @wp.kernel
 def _cg_init_kernel(rhs: wp.array3d(dtype=wp.float32), p: wp.array3d(dtype=wp.float32),
-                    r: wp.array3d(dtype=wp.float32)):
+                    r: wp.array3d(dtype=wp.float32), t0: wp.array3d(dtype=wp.int32)):
+    # An inactive vertex (zero matrix row: a FLUID cell walled in by obstacles on all six
+    # sides) starts with residual 0, not its rhs (CODE-SOL-023). No iteration can reduce
+    # that residual, so Mantaflow's max-norm test stalls on it until CG breaks down and
+    # reports a diverged solve. Its pressure moves no face, so the answer is unchanged.
     i, j, k = wp.tid()
     p[i, j, k] = 0.0
-    r[i, j, k] = rhs[i, j, k]
+    if t0[i, j, k] == VT_INACTIVE:
+        r[i, j, k] = 0.0
+    else:
+        r[i, j, k] = rhs[i, j, k]
 
 
 @wp.kernel
@@ -1236,7 +1243,7 @@ class MGPressureSolver:
                           int(self.frac is not None), int(self.obvel is not None),
                           divg, int(self.divg is not None), phi, curv, self.st,
                           int(self.curv is not None)], device=d)
-        wp.launch(_cg_init_kernel, dim=self.shape, inputs=[self.r0, pressure, self.residual], device=d)
+        wp.launch(_cg_init_kernel, dim=self.shape, inputs=[self.r0, pressure, self.residual, self.t[0]], device=d)
         self.vcycle()
         wp.launch(_search_init_kernel, dim=self.shape, inputs=[self.x[0], self.search], device=d)
         wp.launch(_zero_scalars_kernel, dim=1, inputs=[self.sc, self.res], device=d)

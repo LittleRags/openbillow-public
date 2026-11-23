@@ -297,11 +297,23 @@ def _rasterize_mesh_liquid_kernel(mesh: wp.uint64, dirs: wp.array(dtype=wp.vec3)
     phi[i, j, k] = wp.min(phi[i, j, k], d)
     if use_vel == 0:
         return
-    # sample_mesh (liquid: emission strength 1) and the highest-velocity rule of
+    # sample_mesh (liquid: emission strength 1)
+    _flow_velocity(mesh, p, SQRT3, i, j, k, invel, tris, normals, vel_normal, vel_multi, vel_coord)
+
+
+@wp.func
+def _flow_velocity(mesh: wp.uint64, p: wp.vec3, max_dist: float, i: int, j: int, k: int,
+                   invel: wp.array3d(dtype=wp.vec3), tris: wp.array(dtype=wp.int32),
+                   normals: wp.array(dtype=wp.vec3), vel_normal: float, vel_multi: float,
+                   vel_coord: wp.vec3):
+    # sample_mesh initial velocity and the highest-velocity rule of
     # update_flowsfluids. Barycentric weights (u, v, 1-u-v) as mesh_eval_position.
     n = wp.mesh_query_point_no_sign(mesh, p, SQRT3)
     if not n.result:
         return
+    if max_dist < SQRT3:
+        if wp.length(wp.mesh_eval_position(mesh, n.face, n.u, n.v) - p) >= max_dist:
+            return
     v = wp.vec3(0.0)
     if vel_normal != 0.0:
         w = 1.0 - n.u - n.v
@@ -313,6 +325,19 @@ def _rasterize_mesh_liquid_kernel(mesh: wp.uint64, dirs: wp.array(dtype=wp.vec3)
     v = v + vel_coord
     if wp.length_sq(v) > wp.length_sq(invel[i, j, k]):
         invel[i, j, k] = v
+
+
+@wp.kernel
+def _rasterize_flow_velocity_kernel(mesh: wp.uint64, lo: wp.vec3i, max_dist: float,
+                                    invel: wp.array3d(dtype=wp.vec3), tris: wp.array(dtype=wp.int32),
+                                    normals: wp.array(dtype=wp.vec3), vel_normal: float,
+                                    vel_multi: float, vel_coord: wp.vec3):
+    a, b, c = wp.tid()
+    i = a + lo[0]
+    j = b + lo[1]
+    k = c + lo[2]
+    p = wp.vec3(float(i) + 0.5, float(j) + 0.5, float(k) + 0.5)
+    _flow_velocity(mesh, p, max_dist, i, j, k, invel, tris, normals, vel_normal, vel_multi, vel_coord)
 
 
 # The 26 update_distances ray directions, in Blender's order.
@@ -1008,6 +1033,38 @@ def _apply_force_kernel(flags: wp.array3d(dtype=wp.int32), force: wp.array3d(dty
 
 
 @wp.func
+def _add_if_lower(v: float, f: float):
+    if f > 0.0:
+        return wp.min(v + f, wp.max(v, f))
+    return wp.max(v + f, wp.min(v, f))
+
+
+@wp.kernel
+def _initial_velocity_kernel(flags: wp.array3d(dtype=wp.int32), invel: wp.array3d(dtype=wp.vec3),
+                             vel: wp.array3d(dtype=wp.vec3)):
+    # KnAddForceIfLower (setInitialVelocity): the face mask of _apply_force_kernel.
+    i, j, k = wp.tid()
+    if _border(i, j, k, flags.shape[0], flags.shape[1], flags.shape[2]):
+        return
+    f = flags[i, j, k]
+    cur_fluid = (f & FLUID) != 0
+    if not cur_fluid and (f & EMPTY) == 0:
+        return
+    fc = invel[i, j, k]
+    v = vel[i, j, k]
+    n = flags[i - 1, j, k]
+    if (n & FLUID) != 0 or (cur_fluid and (n & EMPTY) != 0):
+        v[0] = _add_if_lower(v[0], 0.5 * (invel[i - 1, j, k][0] + fc[0]))
+    n = flags[i, j - 1, k]
+    if (n & FLUID) != 0 or (cur_fluid and (n & EMPTY) != 0):
+        v[1] = _add_if_lower(v[1], 0.5 * (invel[i, j - 1, k][1] + fc[1]))
+    n = flags[i, j, k - 1]
+    if (n & FLUID) != 0 or (cur_fluid and (n & EMPTY) != 0):
+        v[2] = _add_if_lower(v[2], 0.5 * (invel[i, j, k - 1][2] + fc[2]))
+    vel[i, j, k] = v
+
+
+@wp.func
 def _clamp_cell(flags: wp.array3d(dtype=wp.int32), orig: wp.array3d(dtype=wp.float32),
                 d: float, fwd: float, p: wp.vec3i, off: wp.vec3, mode: int):
     # doClampComponent: range of the fluid/empty cells around the source (mode 1: and target) point.
@@ -1487,6 +1544,22 @@ class WarpBackend(GuidingMixin, FlameMixin, MixFracMixin, FractionsMixin, Second
                           mesh.indices, normals, float(vel_normal), float(vel_multi),
                           wp.vec3(*vel_coord)],
                   device=self.device)
+
+    def rasterize_flow_velocity(self, mesh, invel, max_distance, vel_normal=0.0, vel_multi=1.0,
+                                vel_coord=(0.0, 0.0, 0.0)):
+        box = self._mesh_box(mesh, invel.shape)
+        if box is None or max_distance <= 0.0:
+            return
+        normals = self._dummy_vec1
+        if vel_normal != 0.0:
+            normals = wp.array(mesh.vertex_normals(), dtype=wp.vec3, device=self.device)
+        wp.launch(_rasterize_flow_velocity_kernel, dim=box[1],
+                  inputs=[mesh.mesh.id, box[0], float(max_distance), invel, mesh.indices, normals,
+                          float(vel_normal), float(vel_multi), wp.vec3(*vel_coord)],
+                  device=self.device)
+
+    def set_initial_velocity(self, flags, vel, invel):
+        wp.launch(_initial_velocity_kernel, dim=flags.shape, inputs=[flags, invel, vel], device=self.device)
 
     def extrapolate_vec3_simple(self, vel, phi, distance=4, inside=False):
         d = self.device

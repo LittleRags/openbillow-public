@@ -21,9 +21,17 @@ import numpy as np
 from . import __version__
 from .forcefields import EffectorWeights, ForceField
 from .liquid import LiquidFlow, LiquidSettings
-from .solver import DomainSettings, MeshFlow, MeshGuide, MeshObstacle
+from .solver import ANIM_FIELDS, DomainSettings, MeshFlow, MeshGuide, MeshObstacle
 
-SCHEMA = 21  # 21: fire_model DIFFUSION (diffusion_hrrpua, diffusion_heat_of_combustion, diffusion_air_fuel_ratio,
+SCHEMA = 27  # 27: gas flow keyframed density/temperature/fuel_amount/velocity_factor (flowN_anim_times/_anim_values; older bakes: constant);
+# 26: liquid sndparticle_stochastic (older bakes read as off, their look unchanged);
+# 25: liquid viscosity_first (CODE-LIQ-023; older bakes read as off, their look unchanged);
+# 24: liquid mesh_smoothen_final (older bakes read as 0, their look unchanged);
+# 23: gas flow initial velocity (use_initial_velocity, velocity_factor, velocity_normal,
+# velocity_coord; older bakes read as off, their look unchanged);
+# 22: diffusion_hrrpua is per m^2 of the flow meshes' surface, no longer of the
+# emitter footprint (CODE-GAS-042; older DIFFUSION bakes resume with the new meaning);
+# 21: fire_model DIFFUSION (diffusion_hrrpua, diffusion_heat_of_combustion, diffusion_air_fuel_ratio,
 # diffusion_radiative_fraction, diffusion_soot_yield; older bakes read the defaults, unused by their fire models);
 # 20: FLAME_FRONT use_viscosity (older bakes read as off, their look unchanged);
 # 19: fire_model FLAME_FRONT (flame_speed, fuel_kelvin, flame_inject, flame_glow_cells,
@@ -55,9 +63,10 @@ def _fields(cls, skip=()):
 _TYPES = {
     "GAS": (DomainSettings, _fields(DomainSettings, _SKIP), MeshFlow,
             ("flow_type", "density", "temperature", "surface_distance", "volume_density",
-             "plane_init", "fuel_amount", "emit_start", "emit_end")),
+             "plane_init", "fuel_amount", "emit_start", "emit_end", "use_initial_velocity",
+             "velocity_factor", "velocity_normal", "velocity_coord")),
     "LIQUID": (LiquidSettings, _fields(LiquidSettings, _SKIP), LiquidFlow,
-               _fields(LiquidFlow, ("verts", "tris", "matrix", "frames"))),
+               _fields(LiquidFlow, ("verts", "tris", "matrix", "frames", "anim", "anim_times"))),
 }
 
 
@@ -78,6 +87,11 @@ def _pack(arrays: dict, key: str, o) -> None:
     arrays[f"{key}_matrix"] = np.asarray(o.matrix, np.float64)
     if o.animated:
         arrays[f"{key}_times"] = np.asarray(o.frames, np.float64)
+    if getattr(o, "anim", None):
+        names = [n for n in ANIM_FIELDS if n in o.anim]
+        arrays[f"{key}_anim_times"] = np.asarray(o.anim_times, np.float64)
+        arrays[f"{key}_anim_values"] = np.stack([np.asarray(o.anim[n], np.float64) for n in names], axis=1)
+        arrays[f"{key}_anim_names"] = np.array(names)
 
 
 def write_bake(folder: str, settings: DomainSettings | LiquidSettings, frame_start: int,
@@ -134,6 +148,10 @@ def _unpack(npz, entry: dict, cls, fields):
     times = npz[f"{k}_times"] if f"{k}_times" in npz.files else None
     kw = {a: (tuple(entry[a]) if a in _TUPLE_FIELDS else entry[a])
           for a in fields if a in entry}  # missing keys: dataclass defaults
+    if f"{k}_anim_values" in npz.files:
+        vals = npz[f"{k}_anim_values"]
+        kw["anim"] = {str(n): vals[:, j] for j, n in enumerate(npz[f"{k}_anim_names"])}
+        kw["anim_times"] = npz[f"{k}_anim_times"]
     return cls(npz[f"{k}_verts"], npz[f"{k}_tris"], m, times, **kw)
 
 
@@ -152,6 +170,8 @@ def read_bake(folder: str) -> tuple[DomainSettings | LiquidSettings, int, int]:
            for a, v in doc.get("domain", {}).items() if a in dom_fields}
     if doc.get("schema", 0) < 20:
         dom["use_viscosity"] = False  # before 20 FLAME_FRONT had no viscosity
+    if doc.get("schema", 0) < 26 and dtype == "LIQUID":
+        dom["sndparticle_stochastic"] = False  # before 26 secondary counts were truncated
     if (doc.get("schema", 0) < 17 and dom.get("mesh_generator") == "ANISOTROPIC"
             and abs(dom.get("mesh_particle_radius", 2.0) - 2.0) < 1e-4):
         dom["mesh_particle_radius"] = 1.1447  # before 17 High Quality ignored it and looked like this
@@ -201,11 +221,11 @@ class SettingsHasher:
                 if k.endswith("_times"):
                     continue
                 a = z[k]
-                if not k.endswith("_matrix"):
+                if not k.endswith(("_matrix", "_anim_values")):
                     _update(self._base, k, a)
                     continue
-                tk = k[:-len("matrix")] + "times"
-                self._matrices.append((k, a, z[tk] if a.ndim == 3 and tk in z.files else None))
+                tk = k[:-len("matrix" if k.endswith("_matrix") else "values")] + "times"
+                self._matrices.append((k, a, z[tk] if a.ndim >= 2 and tk in z.files else None))
 
     def digest(self, upto_frame: int | None = None) -> str:
         h = self._base.copy()

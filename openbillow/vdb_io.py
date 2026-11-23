@@ -80,13 +80,15 @@ def _space(shape, min_corner, dx):
 
 
 def write_vdb(path, density, temperature, velocity, min_corner, dx, clip=1e-6, flame=None,
-              noise=None, vel_scale=None):
+              noise=None, vel_scale=None, extra=None):
     """density, temperature (and flame, with fire): (nx,ny,nz) arrays; velocity:
     (nx,ny,nz,3) MAC face values (solver units); with vel_scale written cell-centred in
     m/s (`cell_centred_mps`), else as is. Active where
     density or flame is. noise = (density, flame or None, upres): high-res
     grids written as `density`/`flame` instead of the low-res ones.
     Every grid may be a callable returning the array (see `_read`).
+    extra: {name: grid} further float fog grids at the simulation resolution (e.g. DIFFUSION
+    `fuel`, Y_F, for a candle look).
     Returns the active density voxel count."""
     density = _read(density)
     transform, meta = _space(density.shape, min_corner, dx)
@@ -105,6 +107,8 @@ def write_vdb(path, density, temperature, velocity, min_corner, dx, clip=1e-6, f
     del flame
     t_grid = _grid(vdb.FloatGrid, "temperature", _read(temperature), transform, meta, clip)
     grids = [d_grid, t_grid] + ([f_grid] if f_grid is not None else [])
+    for name, g in (extra or {}).items():
+        grids.append(_grid(vdb.FloatGrid, name, _read(g), transform, meta, clip))
     for g in grids:
         g.gridClass = vdb.GridClass.FOG_VOLUME
     velocity = _owned(velocity)

@@ -307,6 +307,15 @@ class Backend(ABC):
         vel_coord (cells per solver time), and invel = v if |v|² > |invel|²."""
 
     @abstractmethod
+    def rasterize_flow_velocity(self, mesh: Any, invel: VectorGrid, max_distance: float,
+                                vel_normal: float = 0.0, vel_multi: float = 1.0,
+                                vel_coord: Vec3 = (0.0, 0.0, 0.0)) -> None:
+        """The initial-velocity part of `rasterize_mesh_liquid_flow` for a gas flow:
+        cells whose nearest surface point is closer than `max_distance` cells
+        (Blender: emission strength nonzero, min(1.732, surface_distance)) get
+        the same v, kept where |v|² > |invel|². No-op for max_distance <= 0."""
+
+    @abstractmethod
     def set_inflow_flags(self, flags: FlagGrid, phi_in: ScalarGrid) -> None:
         """Mark fluid cells with phi_in < 0 as INFLOW."""
 
@@ -447,6 +456,12 @@ class Backend(ABC):
         (additive, isMAC=False); the solver passes Blender's scaleSpeedFrames."""
 
     @abstractmethod
+    def set_initial_velocity(self, flags: FlagGrid, vel: MACGrid, invel: VectorGrid) -> None:
+        """Mantaflow `setInitialVelocity` (KnAddForceIfLower): per face f = the
+        cell-centred invel averaged onto the face; vel = min(vel + f, max(vel, f))
+        for f > 0, else max(vel + f, min(vel, f)) (raises vel towards f, never past it)."""
+
+    @abstractmethod
     def set_wall_bcs(self, flags: FlagGrid, vel: MACGrid,
                      obvel: MACGrid | None = None, fractions: MACGrid | None = None,
                      phi_obs: ScalarGrid | None = None) -> None:
@@ -563,10 +578,12 @@ class Backend(ABC):
         kelvin_per_heat = (flame_kelvin - ambient_kelvin) / flame_max_temp (heat <-> K as `gas_kelvin`)."""
 
     @abstractmethod
-    def mixfrac_source(self, state: Any, flags: FlagGrid, phi_in: ScalarGrid, hrrpua_kw_m2: float) -> None:
-        """Fuel mass source from the emitters (phi_in < 0, not OBSTACLE): per (i, j) column with
-        n emitter cells, each gets HRRPUA / (dH_c dx) / n kg/(m^3 s), so the source releases
-        HRRPUA (kW/m^2) times the emitters' footprint on the x-y plane."""
+    def mixfrac_source(self, state: Any, flags: FlagGrid, phi_in: ScalarGrid, hrrpua_kw_m2: float,
+                       area_m2: float) -> None:
+        """Fuel mass source from the emitters (phi_in < 0, not OBSTACLE): the source releases
+        HRRPUA (kW/m^2) x area_m2 (the flow meshes' surface area) in total, shared among the
+        emitter cells in proportion to their faces that border gas (a neighbour in the grid
+        that is neither emitter nor OBSTACLE); no such face, no source (CODE-GAS-042)."""
 
     @abstractmethod
     def mixfrac_burn(self, state: Any, flags: FlagGrid, vel: MACGrid, fuel: ScalarGrid,
@@ -774,6 +791,11 @@ class Backend(ABC):
         outer layer 0.5. Overwrites phi. Positions are multiplied by `scale`."""
 
     @abstractmethod
+    def smooth_levelset(self, phi: ScalarGrid, smoothen: int = 1, smoothen_neg: int = 1) -> None:
+        """In place: `smoothen` 7-point mean passes and `smoothen_neg` passes that only lower
+        phi (interior cells), the smoothing the particle level sets end with."""
+
+    @abstractmethod
     def anisotropic_particle_levelset(self, parts: Particles, phi: ScalarGrid,
                                       sim_shape: tuple, radius_factor: float = 1.0,
                                       smoothen: int = 1, smoothen_neg: int = 1,
@@ -845,9 +867,11 @@ class Backend(ABC):
         sums, vel_old = vel. Mantaflow `mapPartsToMAC`."""
 
     @abstractmethod
-    def apic_map_parts_to_mac(self, flags: FlagGrid, vel: MACGrid, parts: Particles) -> None:
+    def apic_map_parts_to_mac(self, flags: FlagGrid, vel: MACGrid, parts: Particles,
+                              weight: VectorGrid | None = None) -> None:
         """APIC splat (velocity plus affine term). Particles need apic=True.
-        Mantaflow `apicMapPartsToMAC`."""
+        Mantaflow `apicMapPartsToMAC`. `weight` (optional) receives the per-face mass, for
+        extrapolate_mac_from_weight / combine_grid_vel as on the FLIP path."""
 
     @abstractmethod
     def apic_map_mac_to_parts(self, parts: Particles, vel: MACGrid, flags: FlagGrid) -> None:

@@ -38,6 +38,9 @@ OUTFLOW = wp.constant(int(Flags.OUTFLOW))
 
 PDELETE = wp.constant(int(ParticleFlags.DELETE))
 PNEW = wp.constant(int(ParticleFlags.NEW))
+# Anisotropic mesh: particles read per neighbour cell before striding (CODE-LIQ-019). Mantaflow
+# keeps at most particle_max (default 16) per interior cell, so normal cells are read in full.
+ANISO_CELL_SAMPLES = wp.constant(64)
 VECTOR_EPSILON = 1.0e-6
 # ParticleBase::globalSeed: adjustNumber seeds RandomStream(parts.getSeed()) afresh each call.
 PARTICLE_SEED = 9832
@@ -244,6 +247,9 @@ def _aniso_kernel(start: wp.array3d(dtype=wp.int32), sorted_idx: wp.array(dtype=
     # volume as the sphere). amat maps an offset (mesh cells) to the unit-sphere space.
     # inv_max = radius / min_half (0 = off): sheet-like axes keep a half-thickness of at
     # least min_half mesh cells, gated per axis (CODE-LIQ-016).
+    # A cell with more than ANISO_CELL_SAMPLES particles is sampled at a stride, each sample
+    # weighted by it (CODE-LIQ-019): thin streams keep every particle (adjustNumber spares the
+    # surface band), clumps of thousands per cell made this loop quadratic in the clump size.
     t = wp.tid()
     if t >= n or (flag[t] & PDELETE) != 0:
         return
@@ -266,13 +272,15 @@ def _aniso_kernel(start: wp.array3d(dtype=wp.int32), sorted_idx: wp.array(dtype=
                 p1 = total[0]
                 if lin + 1 < nx * ny * nz:
                     p1 = start[(lin + 1) // (ny * nz), ((lin + 1) // nz) % ny, (lin + 1) % nz]
-                for q in range(p0, p1):
+                stride = wp.max(1, (p1 - p0 + ANISO_CELL_SAMPLES - 1) // ANISO_CELL_SAMPLES)
+                sw = float(stride)
+                for q in range(p0, p1, stride):
                     d = wp.length(pos[sorted_idx[q]] - x) / h
                     if d < 1.0:
-                        w = 1.0 - d * d * d
+                        w = (1.0 - d * d * d) * sw
                         wsum += w
                         xw += pos[sorted_idx[q]] * w
-                        cnt += 1
+                        cnt += stride
     xw = xw / wsum
     cen[t] = ((1.0 - lam) * x + lam * xw) * scale
     if cnt < nmin:
@@ -287,12 +295,14 @@ def _aniso_kernel(start: wp.array3d(dtype=wp.int32), sorted_idx: wp.array(dtype=
                 p1 = total[0]
                 if lin + 1 < nx * ny * nz:
                     p1 = start[(lin + 1) // (ny * nz), ((lin + 1) // nz) % ny, (lin + 1) % nz]
-                for q in range(p0, p1):
+                stride = wp.max(1, (p1 - p0 + ANISO_CELL_SAMPLES - 1) // ANISO_CELL_SAMPLES)
+                sw = float(stride)
+                for q in range(p0, p1, stride):
                     p = pos[sorted_idx[q]]
                     d = wp.length(p - x) / h
                     if d < 1.0:
                         e = p - xw
-                        cov += wp.outer(e, e) * (1.0 - d * d * d)
+                        cov += wp.outer(e, e) * ((1.0 - d * d * d) * sw)
     cov = cov / wsum
     res = wp.eig3(cov)
     qm = res[0]
@@ -1692,14 +1702,20 @@ class LiquidMixin:
                   inputs=[phi, phi_obs, wp.vec3(*sf), wp.vec3(*(sf * np.float32(0.5))), float(eps)],
                   device=self.device)
 
-    def _smooth_ls(self, phi, smoothen, smoothen_neg):
+    def smooth_levelset(self, phi, smoothen=1, smoothen_neg=1):
+        self._smooth_ls(phi, smoothen, smoothen_neg, keep_border=True)
+
+    def _smooth_ls(self, phi, smoothen, smoothen_neg, keep_border=False):
         dev = self.device
         shape = tuple(phi.shape)
         # Mantaflow's buffer swaps: each pass reads `cur`; the positive pass writes a fresh
         # zeroed grid, the negative one compares against the grid before the positive pass.
         cur, other = phi, self._scratch_float(shape, "ls_smooth")
         for it in range(max(int(smoothen), int(smoothen_neg))):
-            other.zero_()
+            if keep_border:  # the outer layer keeps its values (Mantaflow's zeroes it)
+                wp.copy(other, cur)
+            else:
+                other.zero_()
             if it < smoothen:
                 wp.launch(_smooth_ls_kernel, dim=shape, inputs=[cur, other, 0], device=dev)
                 cur, other = other, cur
@@ -1753,11 +1769,11 @@ class LiquidMixin:
         wp.launch(_stomp_divide_kernel, dim=vel.shape, inputs=[vel, weight, vel_old, VECTOR_EPSILON],
                   device=dev)
 
-    def apic_map_parts_to_mac(self, flags, vel, parts):
+    def apic_map_parts_to_mac(self, flags, vel, parts, weight=None):
         if parts.cx is None:
             raise ValueError("apic_map_parts_to_mac: particles were made without apic=True")
         dev = self.device
-        mass = self._scratch_vec(vel.shape, "apic_mass")
+        mass = weight if weight is not None else self._scratch_vec(vel.shape, "apic_mass")
         mass.zero_()
         vel.zero_()
         if parts.n:

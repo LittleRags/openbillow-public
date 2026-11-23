@@ -111,6 +111,10 @@ class LiquidSettings(GuideSettings):
     # Improvement (on by default; off = Blender): give velOld the same outer-layer copy as vel
     # before the FLIP update, so floor particles stop gaining speed (NOTES, FLIP quirk).
     flip_wall_fix: bool = True
+    # CODE-LIQ-023: viscosity (and diffusion) before gravity and force fields. Blender adds
+    # gravity first; the no-slip viscous step then holds the wall layer back from -g dt, and
+    # the pressure solve leaves that shear as a flow up the walls (honey at rest climbs).
+    viscosity_first: bool = False
     # Improvement (on by default; off = Blender's pushOutofObs): exact swept collisions of the
     # particles with the obstacle meshes and the domain walls, `collision_margin`
     # cells off the surface, with the velocity into the obstacle removed.
@@ -155,6 +159,12 @@ class LiquidSettings(GuideSettings):
     # mesh cell inside the wall, so the surface meets the glass instead of stopping short.
     # Off by default: bakes and presets from before it keep their look.
     mesh_wall_contact: bool = False
+    # Final smoothing (CODE-LIQ-022, not in Blender): mean passes on the finished surface (the
+    # particle level set joined with the simulation's phi), which the passes above cannot
+    # reach: the join puts the simulation's grid-scale bumps back. Removes the ripples real
+    # liquids lose to surface tension; the surface rises about one mesh cell at 30 passes.
+    # 0 = off (older bakes and presets keep their look).
+    mesh_smoothen_final: int = 0
     # Secondary particles (Blender's liquid_step_particles, once per frame). Mantaflow simulates
     # all three types when any is on; the use_* flags only choose what is written.
     use_spray_particles: bool = False
@@ -180,6 +190,9 @@ class LiquidSettings(GuideSettings):
     sndparticle_antitunneling: str = "OFF"  # OFF (Blender) | AUTO | FIXED (Mantaflow, steps below)
     sndparticle_antitunnel_steps: int = 4
     sndparticle_sampling: str = "SINGLE"  # SINGLE (Blender) | MULTIPLE (8 points per cell)
+    # Stochastic rounding of the emitted count per cell (expected count independent of dt and
+    # time_scale). False = Blender's truncation, which loses almost all particles at small dt.
+    sndparticle_stochastic: bool = True
     # Guiding (Blender "Guides", as DomainSettings).
     flows: list[LiquidFlow] = field(default_factory=list)
     obstacles: list[MeshObstacle] = field(default_factory=list)
@@ -271,10 +284,8 @@ class LiquidSolver(_FrameStepper):
         self.phi_parts = b.scalar_grid(sh)
         self.phi_in = b.scalar_grid(sh, PHI_MAX)
         self.phi_obs = b.scalar_grid(sh, PHI_MAX)
-        self.vel_parts = self.map_weights = None
-        if not s.use_apic:
-            self.vel_parts = b.mac_grid(sh)
-            self.map_weights = b.vector_grid(sh)
+        self.vel_parts = b.mac_grid(sh)     # particle velocities, combined into the narrow band
+        self.map_weights = b.vector_grid(sh)
         self.parts = b.particles(1 << 16, apic=s.use_apic)
         self.mesh_scale = max(1, int(s.mesh_scale))
         self.phi_mesh = self.phi_mesh_parts = None   # allocated by surface()
@@ -349,7 +360,8 @@ class LiquidSolver(_FrameStepper):
                                (s.sndparticle_tau_min_k, s.sndparticle_tau_max_k), self.dx)
         b.sample_secondary_particles(self.snd, flags, vel, self.pot_ta, self.pot_wc, self.pot_ke, nr,
                                      s.sndparticle_k_ta, s.sndparticle_k_wc, s.sndparticle_l_min,
-                                     s.sndparticle_l_max, dt, sampling=s.sndparticle_sampling)
+                                     s.sndparticle_l_max, dt, sampling=s.sndparticle_sampling,
+                                     stochastic=s.sndparticle_stochastic, seed=self.frame * 104729 + 17)
         b.update_secondary_particles(self.snd, flags, vel, nr, self.gravity, s.sndparticle_k_b,
                                      s.sndparticle_k_d, dt, antitunneling=s.sndparticle_antitunneling,
                                      antitunnel_steps=s.sndparticle_antitunnel_steps,
@@ -446,6 +458,11 @@ class LiquidSolver(_FrameStepper):
         """Outer layers of the mesh level set set to 0.5 (Blender's phi_sm.setBound)."""
         return 2 * self.mesh_scale - 1 if self.s.use_fractions else self.mesh_scale
 
+    def _add_forces(self, flags, vel, dt, forces) -> None:
+        self.b.add_gravity(flags, vel, tuple(g * dt for g in self.gravity))
+        if forces:
+            self.b.add_force_field(flags, vel, self.forces, force_scale(self))
+
     def _wall_bcs(self) -> None:
         if self.fractions is not None:  # Blender passes no obvel with fractions
             self.b.set_wall_bcs(self.flags, self.vel, None, self.fractions, self.phi_obs)
@@ -522,6 +539,8 @@ class LiquidSolver(_FrameStepper):
                                       scale=float(sc))
         b.add_const(phi, 1.0)
         b.join(phi, pp)
+        if s.mesh_smoothen_final > 0:
+            b.smooth_levelset(phi, s.mesh_smoothen_final, s.mesh_smoothen_final)
         b.extrapolate_ls_simple(phi, distance=self.NARROW_BAND + 2, inside=True)
         b.extrapolate_ls_simple(phi, distance=3)
         if wall:
@@ -615,8 +634,8 @@ class LiquidSolver(_FrameStepper):
                 b.set_mesh_transform(m, self.world_to_cell @ f.matrix_at(t), dt)
             iv = self.invel if f.use_initial_velocity else None
             b.rasterize_mesh_liquid_flow(m, self.phi_in, f.surface_distance, f.plane_init, iv,
-                                         f.velocity_normal, f.velocity_factor,
-                                         tuple(v * self.vel_scale for v in f.velocity_coord))
+                                         f.value("velocity_normal", t), f.value("velocity_factor", t),
+                                         tuple(v * self.vel_scale for v in f.vec("velocity_coord", t)))
         if self._outflows:
             if self.phi_out_static is not None:
                 b.copy(self.phi_out, self.phi_out_static)
@@ -731,21 +750,23 @@ class LiquidSolver(_FrameStepper):
                 corr = min(max(s.volume_correction_rate * err, -0.2), 0.2)
                 div = -corr / self.frame_length
 
-        # With APIC, Blender's extrapolateMACFromWeight / combineGridVel run on
-        # grids APIC never fills, so they are no-ops: skipped.
+        # Particles live only in the narrow band; deeper cells keep the advected grid
+        # velocity. CODE-LIQ-021: Blender's APIC splats straight into vel (its
+        # extrapolateMACFromWeight / combineGridVel run on grids APIC never fills), which
+        # wipes the velocity below the band every step (a swirl lost ~2/3 of its speed).
+        # APIC now goes through the same combine as FLIP.
         if s.use_apic:
-            b.apic_map_parts_to_mac(flags, vel, parts)
+            b.apic_map_parts_to_mac(flags, self.vel_parts, parts, self.map_weights)
         else:
             b.map_parts_to_mac(flags, self.vel_parts, self.vel_old, parts, self.map_weights)
-            b.extrapolate_mac_from_weight(self.vel_parts, self.map_weights, distance=2)
-            b.combine_grid_vel(self.vel_parts, self.map_weights, vel, phi,
-                               narrow_band=self.COMBINE_BAND, thresh=0.0)
+        b.extrapolate_mac_from_weight(self.vel_parts, self.map_weights, distance=2)
+        b.combine_grid_vel(self.vel_parts, self.map_weights, vel, phi,
+                           narrow_band=self.COMBINE_BAND, thresh=0.0)
         b.copy(self.vel_old, vel)
 
-        b.add_gravity(flags, vel, tuple(g * dt for g in self.gravity))
-        if forces:
-            b.add_force_field(flags, vel, self.forces, force_scale(self))
         into_obs = fr is not None
+        if not s.viscosity_first:
+            self._add_forces(flags, vel, dt, forces)
         b.extrapolate_mac_simple(flags, vel, distance=2, into_obs=into_obs)
         self._wall_bcs()
         if s.use_diffusion:  # alpha = kinematic viscosity * dt * res^2, domain size in metres
@@ -760,6 +781,10 @@ class LiquidSolver(_FrameStepper):
             else:
                 self._visc_stats.append(b.apply_viscosity(flags, phi, vel, s.viscosity_value, dt,
                                                           1.0 / max(self.shape)))
+            self._wall_bcs()
+        if s.viscosity_first:
+            self._add_forces(flags, vel, dt, forces)
+            b.extrapolate_mac_simple(flags, vel, distance=2, into_obs=into_obs)
             self._wall_bcs()
         pd = None
         if self.guiding:  # PD_fluid_guiding: phi (ghost fluid), no obvel
